@@ -226,6 +226,8 @@ private:
 
     uint64_t m_cycle = 0;
     uint64_t m_nextCommitCycle = UINT64_MAX;
+    // Occupied slots of the flag, store and VF/VI/ACC write pipelines (bit n = slot n).
+    uint32_t m_flagValid = 0, m_storeValid = 0, m_vfWriteValid = 0, m_viWriteValid = 0, m_accWriteValid = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
