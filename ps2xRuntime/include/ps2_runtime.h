@@ -290,6 +290,21 @@ public:
     bool loadELF(const std::string &elfPath);
     void run();
 
+    // Headless mode: no window, no audio device and no frame presentation. run() waits for the
+    // game thread, or stops it once the time limit (seconds, 0 = none) has passed.
+    void setHeadless(bool headless, double runTimeLimitSeconds = 0.0);
+
+    // Guest RAM used for interrupt/callback invocation stacks (default: carved down from the top of
+    // RAM). Games whose main thread stack sits at the top of RAM need it moved. Call after loadELF().
+    void setAsyncCallbackStackRegion(uint32_t floor, uint32_t top);
+    bool isHeadless() const { return m_headless; }
+
+    // Observes every slow-path guest access (I/O registers, GS privileged registers, scratchpad,
+    // uncached RAM mirrors). Called before the access is performed.
+    using MmioTraceHook = void (*)(bool isWrite, uint32_t address, uint32_t size,
+                                   uint64_t lo, uint64_t hi, const R5900Context *ctx);
+    static void setMmioTraceHook(MmioTraceHook hook);
+
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
@@ -476,6 +491,7 @@ private:
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
     void HandleIntegerOverflow(R5900Context *ctx);
+    void runHeadless();
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
@@ -524,6 +540,8 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    bool m_headless = false;
+    double m_runTimeLimitSeconds = 0.0;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};

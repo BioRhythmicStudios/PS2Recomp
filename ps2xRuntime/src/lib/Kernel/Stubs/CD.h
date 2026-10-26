@@ -10,6 +10,9 @@
 namespace ps2_stubs
 {
 
+    // Streams continue past the end of the file they started on (zeros beyond it), as the drive does.
+    void setCdStreamPastFileEnd(bool enabled);
+
     struct CdDebugFileEntry
     {
         std::string key;

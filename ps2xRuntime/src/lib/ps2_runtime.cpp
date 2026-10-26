@@ -728,6 +728,11 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        if (m_headless)
+        {
+            m_audioBackend.setAudioReady(false);
+            return true;
+        }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
@@ -2013,8 +2018,27 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+namespace
+{
+    std::atomic<PS2Runtime::MmioTraceHook> g_mmioTraceHook{nullptr};
+
+    inline void traceMmio(bool isWrite, uint32_t address, uint32_t size, uint64_t lo, uint64_t hi, const R5900Context *ctx)
+    {
+        if (PS2Runtime::MmioTraceHook hook = g_mmioTraceHook.load(std::memory_order_relaxed))
+        {
+            hook(isWrite, address, size, lo, hi, ctx);
+        }
+    }
+}
+
+void PS2Runtime::setMmioTraceHook(MmioTraceHook hook)
+{
+    g_mmioTraceHook.store(hook, std::memory_order_relaxed);
+}
+
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    traceMmio(false, vaddr, 1u, 0u, 0u, ctx);
     try
     {
         return m_memory.read8(vaddr);
@@ -2028,6 +2052,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    traceMmio(false, vaddr, 2u, 0u, 0u, ctx);
     try
     {
         return m_memory.read16(vaddr);
@@ -2041,6 +2066,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    traceMmio(false, vaddr, 4u, 0u, 0u, ctx);
     try
     {
         return m_memory.read32(vaddr);
@@ -2054,6 +2080,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    traceMmio(false, vaddr, 8u, 0u, 0u, ctx);
     try
     {
         return m_memory.read64(vaddr);
@@ -2067,6 +2094,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    traceMmio(false, vaddr, 16u, 0u, 0u, ctx);
     try
     {
         return m_memory.read128(vaddr);
@@ -2081,6 +2109,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
+    traceMmio(true, vaddr, 1u, value, 0u, ctx);
     try
     {
         m_memory.write8(vaddr, value);
@@ -2094,6 +2123,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
+    traceMmio(true, vaddr, 2u, value, 0u, ctx);
     try
     {
         m_memory.write16(vaddr, value);
@@ -2107,6 +2137,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    traceMmio(true, vaddr, 4u, value, 0u, ctx);
     try
     {
         m_memory.write32(vaddr, value);
@@ -2121,6 +2152,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
+    traceMmio(true, vaddr, 8u, value, 0u, ctx);
     try
     {
         m_memory.write64(vaddr, value);
@@ -2136,6 +2168,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    traceMmio(true, vaddr, 16u, _parts[0], _parts[1], ctx);
     try
     {
         m_memory.write128(vaddr, value);
@@ -2339,6 +2372,59 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+void PS2Runtime::setAsyncCallbackStackRegion(uint32_t floor, uint32_t top)
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    m_asyncCallbackStackFloor = std::min(floor, PS2_RAM_SIZE);
+    m_asyncCallbackStackTop = std::min(top, PS2_RAM_SIZE);
+}
+
+void PS2Runtime::setHeadless(bool headless, double runTimeLimitSeconds)
+{
+    m_headless = headless;
+    m_runTimeLimitSeconds = runTimeLimitSeconds;
+}
+
+void PS2Runtime::runHeadless()
+{
+    std::atomic<bool> gameThreadFinished{false};
+    std::thread gameThread([&]()
+                           {
+        ThreadNaming::SetCurrentThreadName("GameThread");
+        try
+        {
+            m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
+            m_eeScheduler->run();
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Error during program execution: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "Error during program execution: unknown exception" << std::endl;
+        }
+        gameThreadFinished.store(true, std::memory_order_release); });
+
+    const auto start = std::chrono::steady_clock::now();
+    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+        if (m_runTimeLimitSeconds > 0.0 && elapsed.count() >= m_runTimeLimitSeconds)
+        {
+            RUNTIME_LOG("[run] headless time limit reached");
+            break;
+        }
+    }
+
+    requestStop();
+    if (gameThread.joinable())
+    {
+        gameThread.join();
+    }
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2356,6 +2442,12 @@ void PS2Runtime::run()
     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+
+    if (m_headless)
+    {
+        runHeadless();
+        return;
+    }
 
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);

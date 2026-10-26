@@ -31,6 +31,12 @@ namespace ps2_stubs
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
 
+        // Opt-in: like the real drive, a stream keeps reading past the end of the file it was started
+        // on. Sectors beyond that file are not known when the disc is mounted as loose files, so they
+        // read as zeros. The default (off) ends the stream at the file's last sector.
+        bool g_cdStreamPastFileEnd = false;
+        uint32_t g_cdStreamFileEndLbn = 0xFFFFFFFFu;
+
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
@@ -164,9 +170,33 @@ namespace ps2_stubs
         void restartCdStreamAt(uint32_t lbn, PS2Runtime *runtime)
         {
             g_cdStreamingLbn = lbn;
-            g_cdStreamingEndLbn = cdStreamingEndLbnForStart(lbn);
+            g_cdStreamFileEndLbn = cdStreamingEndLbnForStart(lbn);
+            g_cdStreamingEndLbn = g_cdStreamPastFileEnd ? 0xFFFFFFFFu : g_cdStreamFileEndLbn;
             resetCdStreamProduction(runtime);
         }
+
+        // Stream sectors: file data up to the file's end, zeros beyond it (past-file-end mode only).
+        bool readCdStreamSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst)
+        {
+            uint32_t inFile = sectors;
+            if (g_cdStreamPastFileEnd && g_cdStreamFileEndLbn != 0xFFFFFFFFu)
+            {
+                inFile = lbn < g_cdStreamFileEndLbn ? std::min(sectors, g_cdStreamFileEndLbn - lbn) : 0u;
+            }
+            if (inFile != 0u && !readCdSectors(lbn, inFile, dst, static_cast<size_t>(inFile) * kCdSectorSize))
+            {
+                return false;
+            }
+            std::memset(dst + static_cast<size_t>(inFile) * kCdSectorSize, 0,
+                        static_cast<size_t>(sectors - inFile) * kCdSectorSize);
+            g_lastCdError = 0;
+            return true;
+        }
+    }
+
+    void setCdStreamPastFileEnd(bool enabled)
+    {
+        g_cdStreamPastFileEnd = enabled;
     }
 
     CdDebugSnapshot getCdDebugSnapshot()
@@ -808,7 +838,7 @@ namespace ps2_stubs
 
                 const uint32_t readLbn = g_cdStreamingLbn;
                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
-                if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
+                if (!readCdStreamSectors(readLbn, sectors, rdram + offset))
                 {
                     finishCdStRead(rdram, ctx, state, g_lastCdError);
                     return;
@@ -958,9 +988,9 @@ namespace ps2_stubs
 
     void sceCdStStat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t buffered = bufferedCdStreamSectors(runtime);
-        const uint32_t bankSize = std::max(1u, g_cdStreamTiming.sectorsPerBank);
-        setReturnS32(ctx, static_cast<int32_t>((buffered / bankSize) * bankSize));
+        // Whole banks, except once production has reached the end of the stream: a file shorter than
+        // one bank would otherwise never report any data.
+        setReturnS32(ctx, static_cast<int32_t>(readableCdStreamSectors(runtime)));
     }
 
     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
