@@ -327,6 +327,8 @@ namespace
         return absolute.lexically_normal();
     }
 
+    bool g_memoryCardRootPinned = false;
+
     PS2Runtime::IoPaths &runtimeIoPaths()
     {
         static PS2Runtime::IoPaths paths = []()
@@ -1067,9 +1069,18 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        if (!g_memoryCardRootPinned)
+            paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    setIoPaths(paths);
+}
+
+void PS2Runtime::setMemoryCardRoot(const std::filesystem::path &root)
+{
+    IoPaths paths = runtimeIoPaths();
+    paths.mcRoot = root;
+    g_memoryCardRootPinned = !root.empty();
     setIoPaths(paths);
 }
 
@@ -1633,7 +1644,14 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
 
 uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
 {
-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    // The heap must stay below the runtime's interrupt/callback stack region (by default the top
+    // 1 MB of RAM). When that region has been moved below the ELF image, RAM itself is the limit.
+    uint32_t hardLimit = PS2_RAM_SIZE;
+    {
+        std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+        if (m_asyncCallbackStackFloor >= kGuestHeapDefaultBase)
+            hardLimit = std::min(hardLimit, m_asyncCallbackStackFloor);
+    }
     if (guestLimit == 0u || guestLimit > hardLimit)
     {
         return hardLimit;
@@ -2377,6 +2395,70 @@ void PS2Runtime::setAsyncCallbackStackRegion(uint32_t floor, uint32_t top)
     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
     m_asyncCallbackStackFloor = std::min(floor, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = std::min(top, PS2_RAM_SIZE);
+}
+
+namespace
+{
+    // PCCR fields (EE Core User's Manual, performance counter): CTE bit 31; per counter the mode
+    // enables EXL/K/S/U and a 5-bit event number.
+    constexpr uint32_t kPccrCte = 1u << 31;
+    constexpr uint32_t kPerfEventCycle = 1u;
+
+    bool perfCounterCountsCycles(uint32_t pccr, int counter)
+    {
+        if ((pccr & kPccrCte) == 0u)
+            return false;
+        const uint32_t modes = counter == 0 ? (pccr >> 1) & 0xFu : (pccr >> 11) & 0xFu;
+        const uint32_t event = counter == 0 ? (pccr >> 5) & 0x1Fu : (pccr >> 15) & 0x1Fu;
+        return modes != 0u && event == kPerfEventCycle;
+    }
+}
+
+void PS2Runtime::foldPerfCounters()
+{
+    const uint64_t now = m_eeScheduler->currentCycle();
+    const uint64_t elapsed = now - m_perfCycleBase;
+    for (int i = 0; i < 2; ++i)
+        if (perfCounterCountsCycles(m_perfPccr, i))
+            m_perfPcr[i] = static_cast<uint32_t>(m_perfPcr[i] + elapsed);
+    m_perfCycleBase = now;
+}
+
+uint32_t PS2Runtime::readPerfCounter(uint32_t select)
+{
+    foldPerfCounters();
+    switch (select)
+    {
+    case 0u: return m_perfPccr;
+    case 1u: return m_perfPcr[0];
+    case 3u: return m_perfPcr[1];
+    default: return 0u;
+    }
+}
+
+void PS2Runtime::writePerfCounter(uint32_t select, uint32_t value)
+{
+    foldPerfCounters();
+    switch (select)
+    {
+    case 0u:
+        m_perfPccr = value;
+        if (!m_perfUnmodelledEventReported && (value & kPccrCte) != 0u)
+        {
+            const uint32_t ev0 = (value >> 5) & 0x1Fu, ev1 = (value >> 15) & 0x1Fu;
+            const bool on0 = ((value >> 1) & 0xFu) != 0u, on1 = ((value >> 11) & 0xFu) != 0u;
+            if ((on0 && ev0 != kPerfEventCycle) || (on1 && ev1 != kPerfEventCycle))
+            {
+                m_perfUnmodelledEventReported = true;
+                std::cerr << "[perf] PCCR 0x" << std::hex << value << std::dec
+                          << " selects an event other than processor cycles; it will not count" << std::endl;
+            }
+        }
+        break;
+    case 1u: m_perfPcr[0] = value; break;
+    case 3u: m_perfPcr[1] = value; break;
+    default: break;
+    }
 }
 
 void PS2Runtime::setHeadless(bool headless, double runTimeLimitSeconds)

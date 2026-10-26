@@ -3,6 +3,11 @@
 
 namespace ps2_syscalls
 {
+    namespace
+    {
+        uint32_t g_setupThreadStackBottom = 0u; // set by SetupThread, read by SetupHeap
+    }
+
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
@@ -531,6 +536,11 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+        // Lowest address of the main thread's stack: SetupHeap(start, -1) extends the heap up to it.
+        if (stack == 0xFFFFFFFFu)
+            g_setupThreadStackBottom = stackSize < PS2_RAM_SIZE ? PS2_RAM_SIZE - stackSize : 0u;
+        else
+            g_setupThreadStackBottom = stack;
         setReturnU32(ctx, sp);
     }
 
@@ -545,6 +555,14 @@ namespace ps2_syscalls
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
+
+        // The EE kernel ends a heap of size -1 at the main thread's stack (SetupThread), not at a
+        // fixed address: Maximo crt0 puts its stack at 0x1F4B000 and sizes one malloc to fill the gap.
+        if ((heapSize == 0u || heapSize == 0xFFFFFFFFu) && g_setupThreadStackBottom > heapBase &&
+            g_setupThreadStackBottom <= PS2_RAM_SIZE)
+        {
+            heapLimit = g_setupThreadStackBottom;
+        }
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {

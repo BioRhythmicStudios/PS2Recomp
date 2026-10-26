@@ -299,6 +299,12 @@ public:
     void setAsyncCallbackStackRegion(uint32_t floor, uint32_t top);
     bool isHeadless() const { return m_headless; }
 
+    // COP0 register 25: PCCR (MTPS/MFPS, select 0) and the counters PCR0 (select 1) and PCR1
+    // (select 3). Counters run on the scheduler's guest EE cycle clock while PCCR.CTE is set and
+    // their event is "processor cycle" (1) in any enabled mode; other events are not modelled.
+    uint32_t readPerfCounter(uint32_t select);
+    void writePerfCounter(uint32_t select, uint32_t value);
+
     // Observes every slow-path guest access (I/O registers, GS privileged registers, scratchpad,
     // uncached RAM mirrors). Called before the access is performed.
     using MmioTraceHook = void (*)(bool isWrite, uint32_t address, uint32_t size,
@@ -372,6 +378,9 @@ public:
 
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
+    // Pins the memory card root (call before loadELF): loadELF otherwise puts the cards in
+    // <ELF directory>/mc0, next to the game's files.
+    static void setMemoryCardRoot(const std::filesystem::path &root);
     static void configureIoPathsFromElf(const std::string &elfPath);
 
     void SignalException(R5900Context *ctx, PS2Exception exception);
@@ -531,6 +540,13 @@ private:
     bool m_guestHeapConfigured = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+
+    // Performance counters (see readPerfCounter): values as of m_perfCycleBase.
+    uint32_t m_perfPccr = 0u;
+    uint32_t m_perfPcr[2] = {0u, 0u};
+    uint64_t m_perfCycleBase = 0u;
+    bool m_perfUnmodelledEventReported = false;
+    void foldPerfCounters();
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

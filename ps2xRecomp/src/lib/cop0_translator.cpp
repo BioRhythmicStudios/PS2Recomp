@@ -64,7 +64,8 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_debug);", rt);
             case COP0_REG_PERF:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_perf);", rt);
+                // MFPS (PCCR) / MFPC (PCR0, PCR1): the register is selected by the low instruction bits.
+                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)runtime->readPerfCounter(0x{:X}u));", rt, inst.raw & 0x3Fu);
             case COP0_REG_TAGLO:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_taglo);", rt);
             case COP0_REG_TAGHI:
@@ -114,7 +115,8 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("ctx->cop0_debug = GPR_U32(ctx, {});", rt);
             case COP0_REG_PERF:
-                return fmt::format("ctx->cop0_perf = GPR_U32(ctx, {});", rt);
+                // MTPS (PCCR) / MTPC (PCR0, PCR1): the register is selected by the low instruction bits.
+                return fmt::format("runtime->writePerfCounter(0x{:X}u, GPR_U32(ctx, {}));", inst.raw & 0x3Fu, rt);
             case COP0_REG_TAGLO:
                 return fmt::format("ctx->cop0_taglo = GPR_U32(ctx, {});", rt);
             case COP0_REG_TAGHI:
