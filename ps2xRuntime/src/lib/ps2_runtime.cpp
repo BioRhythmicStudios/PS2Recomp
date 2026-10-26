@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "rlgl.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -2623,6 +2624,20 @@ void PS2Runtime::run()
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        {
+            // PS2X_SCREENSHOT_SECONDS=<s>: save what the window shows every <s> seconds (frame_NNN.png in
+            // the working directory), so a headless check can see the presented pixels.
+            static const char *shotEnv = std::getenv("PS2X_SCREENSHOT_SECONDS");
+            static const double shotInterval = shotEnv ? std::atof(shotEnv) : 0.0;
+            static double nextShot = shotInterval;
+            static int shotIndex = 0;
+            if (shotInterval > 0.0 && GetTime() >= nextShot)
+            {
+                rlDrawRenderBatchActive(); // raylib batches draws until EndDrawing; flush before reading back
+                TakeScreenshot(TextFormat("frame_%03d.png", shotIndex++));
+                nextShot += shotInterval;
+            }
         }
         EndDrawing();
 
