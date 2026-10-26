@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_cpu_profile.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -9,6 +10,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -16,6 +19,54 @@
 #include <stdexcept>
 
 using namespace GSInternal;
+
+namespace gs_cpu_profile
+{
+    static thread_local Snapshot s_stats;
+    bool enabled()
+    {
+        static const bool value = [] { const char *v = std::getenv("PS2_GS_PROFILE"); return v && v[0] == '1'; }();
+        return value;
+    }
+    uint64_t now()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    uint64_t timerOverhead()
+    {
+        static const uint64_t overhead = [] {
+            uint64_t total = 0;
+            for (unsigned i = 0; i < 100000; ++i)
+            {
+                const uint64_t start = now();
+                total += now() - start;
+            }
+            return total / 100000;
+        }();
+        return overhead;
+    }
+    static unsigned samplePhase(uint32_t &state)
+    {
+        // Use high bits of a xorshift sequence so periodic texture coordinates
+        // and page boundaries cannot line up with every sampled call.
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state >> 26;
+    }
+    void add(Stage stage, uint64_t nanoseconds, uint64_t calls)
+    {
+        s_stats.nanoseconds[stage] += nanoseconds;
+        s_stats.calls[stage] += calls;
+    }
+    Snapshot take()
+    {
+        Snapshot result = s_stats;
+        s_stats = {};
+        return result;
+    }
+}
 
 namespace
 {
@@ -684,6 +735,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
 
 uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
 {
+    static thread_local uint32_t sampleState = 0x6D2B79F5u;
+    gs_cpu_profile::Scope profile(gs_cpu_profile::TextureRead,
+        gs_cpu_profile::enabled() && gs_cpu_profile::samplePhase(sampleState) == 0u);
     if (!m_vram)
         return 0u;
 
@@ -865,6 +919,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
 {
+    static thread_local uint32_t sampleState = 0xA341316Cu;
+    const unsigned samplePhase = gs_cpu_profile::enabled() ? gs_cpu_profile::samplePhase(sampleState) : 63u;
+    gs_cpu_profile::Scope pixelProfile(gs_cpu_profile::Pixel, samplePhase == 0u);
     const auto &ctx = state.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
@@ -907,7 +964,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     u32 fbrgba = 0;
     if (frmw)
     {
-        rawFramebufferPixel = ReadVramUnlocked(fpsm, fbp, fbw, x, y);
+        {
+            gs_cpu_profile::Scope profile(gs_cpu_profile::FrameRead, samplePhase == 1u);
+            rawFramebufferPixel = ReadVramUnlocked(fpsm, fbp, fbw, x, y);
+        }
         fbrgba = rawFramebufferPixel;
 
         if (bitsPerPixel(fpsm) == 16)
@@ -937,11 +997,13 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         zpass = true;
         break;
     case 2:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+        { gs_cpu_profile::Scope profile(gs_cpu_profile::DepthRead, samplePhase == 2u);
+          storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y); }
         zpass = static_cast<uint32_t>(z) >= storedZ;
         break;
     case 3:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+        { gs_cpu_profile::Scope profile(gs_cpu_profile::DepthRead, samplePhase == 2u);
+          storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y); }
         zpass = static_cast<uint32_t>(z) > storedZ;
         break;
     }
@@ -959,6 +1021,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
 
         if (state.prim.abe)
         {
+            gs_cpu_profile::Scope profile(gs_cpu_profile::Blend, samplePhase == 3u);
             uint8_t dr = fbrgba & 0xFF;
             uint8_t dg = (fbrgba >> 8) & 0xFF;
             uint8_t db = (fbrgba >> 16) & 0xFF;
@@ -1020,12 +1083,14 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
             pixel = Rgba8888ToRgba5551(pixel);
         }
 
-        WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
+        { gs_cpu_profile::Scope profile(gs_cpu_profile::FrameWrite, samplePhase == 4u);
+          WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel); }
     }
 
     if (writeMask.writeDepth && !ctx.zbuf.zmask)
     {
-        WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
+        { gs_cpu_profile::Scope profile(gs_cpu_profile::DepthWrite, samplePhase == 5u);
+          WriteVramUnlocked(zpsm, zbp, fbw, x, y, z); }
     }
 }
 
@@ -1074,6 +1139,9 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
 
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
 {
+    static thread_local uint32_t sampleState = 0xC8013EA4u;
+    gs_cpu_profile::Scope profile(gs_cpu_profile::Texture,
+        gs_cpu_profile::enabled() && gs_cpu_profile::samplePhase(sampleState) == 0u);
     const auto &ctx = state.context;
     const auto &tex = ctx.tex0;
 
@@ -1104,7 +1172,6 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
-
         u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
         switch (tex.psm)
@@ -1178,6 +1245,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 {
+    gs_cpu_profile::Scope profile(gs_cpu_profile::Sprite, gs_cpu_profile::enabled());
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
@@ -1294,6 +1362,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 {
+    gs_cpu_profile::Scope profile(gs_cpu_profile::Triangle, gs_cpu_profile::enabled());
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];

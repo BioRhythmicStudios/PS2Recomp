@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include "runtime/gs/gs_cpu_profile.h"
 
 namespace GSMem
 {
@@ -24,6 +25,7 @@ namespace GSMem
             const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
             if (m_pageBase != pageBase)
             {
+                gs_cpu_profile::Scope profile(gs_cpu_profile::PageCopy, gs_cpu_profile::enabled());
                 std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
                 m_pageBase = pageBase;
             }
