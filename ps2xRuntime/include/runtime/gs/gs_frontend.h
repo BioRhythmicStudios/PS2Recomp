@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -96,6 +97,21 @@ struct GSDebugHistoryEntry
     bool usedPreferred = false;
 };
 
+// Counts of GS stream events that matter for running the GS asynchronously: each one is a point where
+// the producer (game thread) and the GS must agree on ordering or completion. Relaxed atomics; cheap.
+struct GSStreamStats
+{
+    std::atomic<uint64_t> packets{0};       // GS::processGIFPacket calls (arbiter output and XGKICK without memory)
+    std::atomic<uint64_t> packetBytes{0};
+    std::atomic<uint64_t> directRegWrites{0}; // GS::writeRegister from outside the GIF stream (HLE stubs)
+    std::atomic<uint64_t> signal{0};
+    std::atomic<uint64_t> finish{0};
+    std::atomic<uint64_t> label{0};
+    std::atomic<uint64_t> trxdir[4]{};       // transfers started: 0 host->local, 1 local->host, 2 local->local, 3 off
+    std::atomic<uint64_t> localToHostReads{0}; // consumeLocalToHostBytes calls
+    std::atomic<uint64_t> presentationLatches{0};
+};
+
 class GS
 {
 public:
@@ -140,6 +156,7 @@ public:
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
+    const GSStreamStats &streamStats() const { return m_streamStats; }
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -231,6 +248,7 @@ private:
     bool m_hasHostPresentationFrame = false;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
+    GSStreamStats m_streamStats;
 
     static constexpr size_t kDebugHistoryCapacity = 512;
     std::array<GSDebugHistoryEntry, kDebugHistoryCapacity> m_debugHistory{};

@@ -589,6 +589,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    m_streamStats.presentationLatches.fetch_add(1, std::memory_order_relaxed);
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -707,6 +708,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    m_streamStats.packets.fetch_add(1, std::memory_order_relaxed);
+    m_streamStats.packetBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -1126,6 +1129,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    m_streamStats.directRegWrites.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1456,6 +1460,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        m_streamStats.trxdir[m_trxdir].fetch_add(1, std::memory_order_relaxed);
         if (gsTexTraceEnabled())
         {
             static std::set<uint64_t> seen;
@@ -1548,6 +1553,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
+        m_streamStats.signal.fetch_add(1, std::memory_order_relaxed);
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1561,6 +1567,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_FINISH:
     {
+        m_streamStats.finish.fetch_add(1, std::memory_order_relaxed);
         if (m_backend)
         {
             m_backend->Flush();
@@ -1572,6 +1579,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_LABEL:
     {
+        m_streamStats.label.fetch_add(1, std::memory_order_relaxed);
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1714,6 +1722,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    m_streamStats.localToHostReads.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
