@@ -1347,10 +1347,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             uint8_t r, g, b, a;
             if (state.prim.iip)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                // Round: the barycentric weights sum to just under 1, and truncating turns a constant 128 into 127.
+                r = clampU8(static_cast<int>(std::lround(v0.r * w0 + v1.r * w1 + v2.r * w2)));
+                g = clampU8(static_cast<int>(std::lround(v0.g * w0 + v1.g * w1 + v2.g * w2)));
+                b = clampU8(static_cast<int>(std::lround(v0.b * w0 + v1.b * w1 + v2.b * w2)));
+                a = clampU8(static_cast<int>(std::lround(v0.a * w0 + v1.a * w1 + v2.a * w2)));
             }
             else
             {
@@ -1404,7 +1405,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 a = color.a;
             }
 
-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+            const uint8_t fog = clampU8(static_cast<int>(std::lround(v0.fog * w0 + v1.fog * w1 + v2.fog * w2)));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     }

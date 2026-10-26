@@ -775,6 +775,54 @@ void register_ps2_gs_tests()
                      "the next XYZ2 should draw BCD from the advanced strip queue");
         });
 
+        tc.Run("Gouraud triangle keeps a constant alpha exact for the alpha test", [](TestCase &t)
+        {
+            // Maximo draws text with alpha 0x80 at every vertex and TEST "alpha > 0x7F". Interpolating the
+            // constant must not drop below 0x80, or pixels inside the triangle are rejected.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            auto countDrawn = [&](uint64_t testReg, const std::array<uint64_t, 3> &xyz) -> uint32_t
+            {
+                std::fill(vram.begin(), vram.begin() + 64u * 64u * 4u, uint8_t{0});
+                gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, testReg);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3)); // IIP
+                gs.writeRegister(GS_REG_RGBAQ, 0x80FFFFFFull);
+                for (uint64_t vertex : xyz)
+                    gs.writeRegister(GS_REG_XYZ2, vertex);
+
+                uint32_t drawn = 0u;
+                for (uint32_t y = 0u; y < 64u; ++y)
+                    for (uint32_t x = 0u; x < 64u; ++x)
+                        drawn += readReferencePSMCT32Pixel(vram, 0u, 1u, x, y) != 0u ? 1u : 0u;
+                return drawn;
+            };
+
+            uint32_t seed = 12345u;
+            auto coordinate = [&seed]() -> uint64_t
+            {
+                seed = seed * 1103515245u + 12345u;
+                return (seed >> 8) % 1024u; // 1/16-pixel units inside the 64x64 target
+            };
+            uint32_t covered = 0u, rejected = 0u;
+            for (int i = 0; i < 200; ++i)
+            {
+                std::array<uint64_t, 3> xyz{};
+                for (uint64_t &vertex : xyz)
+                    vertex = coordinate() | (coordinate() << 16);
+                const uint32_t all = countDrawn(0x30000ull, xyz);
+                covered += all;
+                rejected += all - countDrawn(0x30000ull | 0x7FDull, xyz); // ATE, GREATER, AREF=0x7F, KEEP
+            }
+            t.IsTrue(covered > 10000u, "the triangles should cover a large area");
+            t.Equals(rejected, 0u, "every pixel with interpolated alpha 0x80 should pass alpha > 0x7F");
+        });
+
         tc.Run("GS fog blends the shaded color toward FOGCOL before framebuffer blending", [](TestCase &t)
         {
             auto renderFoggedPoint = [](bool fogEnabled, uint8_t fog, uint32_t fogColor = 0u) -> uint32_t
