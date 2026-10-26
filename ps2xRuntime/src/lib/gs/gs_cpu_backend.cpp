@@ -1168,10 +1168,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         texVf = t * invQ * static_cast<float>(texH);
     }
 
-    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+    auto sampleWrappedPoint = [&](int sampleU, int sampleV) -> uint32_t
     {
-        sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
-        sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
         u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
         switch (tex.psm)
@@ -1199,7 +1197,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     if (!state.linearFilter)
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        return sampleWrappedPoint(wrapTextureCoordinate(static_cast<int>(texUf), texW, wrapU, minU, maxU),
+                                  wrapTextureCoordinate(static_cast<int>(texVf), texH, wrapV, minV, maxV));
     }
 
     const float sampleU = texUf - 0.5f;
@@ -1211,10 +1210,14 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     const float fx = sampleU - static_cast<float>(u0);
     const float fy = sampleV - static_cast<float>(v0);
 
-    const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
+    const int wrappedU0 = wrapTextureCoordinate(u0, texW, wrapU, minU, maxU);
+    const int wrappedU1 = wrapTextureCoordinate(u1, texW, wrapU, minU, maxU);
+    const int wrappedV0 = wrapTextureCoordinate(v0, texH, wrapV, minV, maxV);
+    const int wrappedV1 = wrapTextureCoordinate(v1, texH, wrapV, minV, maxV);
+    const uint32_t c00 = sampleWrappedPoint(wrappedU0, wrappedV0);
+    const uint32_t c10 = sampleWrappedPoint(wrappedU1, wrappedV0);
+    const uint32_t c01 = sampleWrappedPoint(wrappedU0, wrappedV1);
+    const uint32_t c11 = sampleWrappedPoint(wrappedU1, wrappedV1);
 
     const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
                                   static_cast<uint8_t>(c10 & 0xFFu),
