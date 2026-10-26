@@ -1740,6 +1740,57 @@ void register_ps2_gs_tests()
                      "field presentation should still preserve different source content across field rows");
         });
 
+        tc.Run("latched host presentation scans half-height buffer in interlaced frame mode", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.smode2 = 0x0003ull; // interlaced, frame mode (FFMD=1)
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (511ull << 44); // 512 display lines from a 256-line buffer
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kTop = 0x000000FFu;
+            constexpr uint32_t kSecond = 0x0000FF00u;
+            constexpr uint32_t kLast = 0x00FF0000u;
+            constexpr uint32_t kBeyond = 0x00FFFFFFu; // buffer line 256: the next buffer, never scanned
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 0u, kTop);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 1u, kSecond);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 255u, kLast);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 256u, kBeyond);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "interlaced frame presentation should produce a host frame");
+            t.Equals(latchedHeight, 512u,
+                     "frame presentation should keep the full display height");
+
+            auto pixelAtRow = [&](uint32_t row) -> uint32_t
+            {
+                const size_t off = static_cast<size_t>(row) * 640u * 4u;
+                return static_cast<uint32_t>(latchedFrame[off + 0u]) |
+                       (static_cast<uint32_t>(latchedFrame[off + 1u]) << 8) |
+                       (static_cast<uint32_t>(latchedFrame[off + 2u]) << 16);
+            };
+
+            t.Equals(pixelAtRow(0u), kTop, "display line 0 should show buffer line 0");
+            t.Equals(pixelAtRow(1u), kTop, "display line 1 should repeat buffer line 0");
+            t.Equals(pixelAtRow(2u), kSecond, "display line 2 should show buffer line 1");
+            t.Equals(pixelAtRow(510u), kLast, "display line 510 should show buffer line 255");
+            t.Equals(pixelAtRow(511u), kLast, "display line 511 should repeat buffer line 255");
+        });
+
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

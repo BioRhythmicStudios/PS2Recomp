@@ -48,7 +48,7 @@ static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_HEIGHT = FB_WIDTH * 3 / 4; // 4:3, like the TV picture
 #endif
 struct ElfHeader
 {
@@ -2611,9 +2611,11 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The GS drives a 4:3 TV picture whatever the buffer's pixel count (640x448 NTSC, 640x512 PAL),
+        // so fit a 4:3 rectangle rather than assuming square pixels.
+        constexpr float kDisplayAspect = 4.0f / 3.0f;
+        const float dstHeight = std::min(screenHeight, screenWidth / kDisplayAspect);
+        const float dstWidth = dstHeight * kDisplayAspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2635,7 +2637,13 @@ void PS2Runtime::run()
             if (shotInterval > 0.0 && GetTime() >= nextShot)
             {
                 rlDrawRenderBatchActive(); // raylib batches draws until EndDrawing; flush before reading back
-                TakeScreenshot(TextFormat("frame_%03d.png", shotIndex++));
+                TakeScreenshot(TextFormat("frame_%03d.png", shotIndex));
+                // Also keep the presented GS frame at its native size (gs_NNN.png) for comparisons.
+                Image gsFrame = LoadImageFromTexture(frameTex);
+                ImageCrop(&gsFrame, Rectangle{0.0f, 0.0f, srcWidth, srcHeight});
+                ExportImage(gsFrame, TextFormat("gs_%03d.png", shotIndex));
+                UnloadImage(gsFrame);
+                ++shotIndex;
                 nextShot += shotInterval;
             }
         }
