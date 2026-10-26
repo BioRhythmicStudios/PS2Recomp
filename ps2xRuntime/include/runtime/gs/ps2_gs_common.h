@@ -2,6 +2,7 @@
 #define PS2_GS_COMMON_H
 
 #include "runtime/gs/gs_types.h"
+#include <cmath>
 #include <cstdint>
 
 namespace GSInternal
@@ -56,6 +57,17 @@ static inline uint8_t clampU8(int v)
     if (v < 0) return 0;
     if (v > 255) return 255;
     return static_cast<uint8_t>(v);
+}
+
+// clampU8(std::lround(v)) without the CRT call. For 0 < v < 255 the fraction v - trunc(v) is exact in
+// float, so comparing it with 0.5 rounds half away from zero exactly like lround, without relying on
+// extra precision (adding 0.5 in float would round 0.49999997 up). Negative values and NaN give 0.
+static inline uint8_t roundClampU8(float v)
+{
+    if (!(v > 0.0f)) return 0;
+    if (v >= 255.0f) return v < 2147483648.0f ? 255 : clampU8(static_cast<int>(std::lround(v))); // keep lround's out-of-range result
+    const int whole = static_cast<int>(v);
+    return static_cast<uint8_t>(whole + ((v - static_cast<float>(whole)) >= 0.5f ? 1 : 0));
 }
 }
 

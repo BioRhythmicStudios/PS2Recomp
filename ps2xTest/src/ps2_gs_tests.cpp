@@ -5,6 +5,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
@@ -13,6 +14,8 @@
 #include "Stubs/GS.h"
 
 #include <atomic>
+#include <cmath>
+#include <limits>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -773,6 +776,40 @@ void register_ps2_gs_tests()
                      "XYZ3 should suppress the completed ABC triangle");
             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 4u), kColor,
                      "the next XYZ2 should draw BCD from the advanced strip queue");
+        });
+
+        tc.Run("roundClampU8 matches clampU8(lround) for colour-range floats", [](TestCase &t)
+        {
+            // Every float in [-2, 258) at a stride, plus each half-integer and its float neighbours.
+            uint32_t mismatches = 0;
+            const auto check = [&](float v)
+            {
+                const uint8_t expected = GSInternal::clampU8(static_cast<int>(std::lround(v)));
+                if (GSInternal::roundClampU8(v) != expected)
+                {
+                    if (mismatches++ < 4)
+                    {
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, &v, sizeof(bits));
+                        std::printf("roundClampU8 mismatch: v=%.9g bits=0x%08X expected=%u got=%u\n", v, bits,
+                                    expected, GSInternal::roundClampU8(v));
+                    }
+                }
+            };
+            for (float v = -2.0f; v < 258.0f; v += 0.0001220703125f)
+                check(v);
+            for (int k = -4; k <= 516; ++k)
+            {
+                const float half = static_cast<float>(k) * 0.5f;
+                check(half);
+                check(std::nextafter(half, -1000.0f));
+                check(std::nextafter(half, 1000.0f));
+            }
+            check(std::numeric_limits<float>::quiet_NaN());
+            check(std::numeric_limits<float>::infinity());
+            check(-std::numeric_limits<float>::infinity());
+            check(1.0e30f);
+            t.IsTrue(mismatches == 0u, "roundClampU8 must agree with clampU8(lround) everywhere");
         });
 
         tc.Run("Gouraud triangle keeps a constant alpha exact for the alpha test", [](TestCase &t)

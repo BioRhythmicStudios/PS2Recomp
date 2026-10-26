@@ -23,11 +23,6 @@ using namespace GSInternal;
 namespace gs_cpu_profile
 {
     static thread_local Snapshot s_stats;
-    bool enabled()
-    {
-        static const bool value = [] { const char *v = std::getenv("PS2_GS_PROFILE"); return v && v[0] == '1'; }();
-        return value;
-    }
     uint64_t now()
     {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -347,7 +342,7 @@ namespace
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        return roundClampU8(top + (bottom - top) * fy);
     }
 }
 
@@ -1420,10 +1415,10 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             if (state.prim.iip)
             {
                 // Round: the barycentric weights sum to just under 1, and truncating turns a constant 128 into 127.
-                r = clampU8(static_cast<int>(std::lround(v0.r * w0 + v1.r * w1 + v2.r * w2)));
-                g = clampU8(static_cast<int>(std::lround(v0.g * w0 + v1.g * w1 + v2.g * w2)));
-                b = clampU8(static_cast<int>(std::lround(v0.b * w0 + v1.b * w1 + v2.b * w2)));
-                a = clampU8(static_cast<int>(std::lround(v0.a * w0 + v1.a * w1 + v2.a * w2)));
+                r = roundClampU8(v0.r * w0 + v1.r * w1 + v2.r * w2);
+                g = roundClampU8(v0.g * w0 + v1.g * w1 + v2.g * w2);
+                b = roundClampU8(v0.b * w0 + v1.b * w1 + v2.b * w2);
+                a = roundClampU8(v0.a * w0 + v1.a * w1 + v2.a * w2);
             }
             else
             {
@@ -1477,7 +1472,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 a = color.a;
             }
 
-            const uint8_t fog = clampU8(static_cast<int>(std::lround(v0.fog * w0 + v1.fog * w1 + v2.fog * w2)));
+            const uint8_t fog = roundClampU8(v0.fog * w0 + v1.fog * w1 + v2.fog * w2);
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     }

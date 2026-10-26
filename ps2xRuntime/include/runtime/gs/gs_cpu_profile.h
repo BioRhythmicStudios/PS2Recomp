@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 // Opt-in GS timing, enabled by PS2_GS_PROFILE=1. The counters are consumed on
 // the rendering thread at the host's one-second performance reporting point.
@@ -18,7 +19,12 @@ struct Snapshot
     uint64_t calls[Count]{};
 };
 
-bool enabled();
+// Inline: the per-pixel paths test this, and an out-of-line call cost about 1.4% of a 3D frame.
+inline bool enabled()
+{
+    static const bool value = [] { const char *v = std::getenv("PS2_GS_PROFILE"); return v && v[0] == '1'; }();
+    return value;
+}
 Snapshot take();
 void add(Stage stage, uint64_t nanoseconds, uint64_t calls = 1);
 uint64_t now();
