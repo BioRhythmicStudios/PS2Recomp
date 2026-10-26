@@ -179,6 +179,23 @@ void register_ps2_memory_tests()
             t.Equals(mem.read32(0x00103000u), 0x2468ACE0u, "writes through 0x3010 alias should land in base RDRAM");
         });
 
+        tc.Run("128-bit fast accesses ignore the low four address bits", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+            for (uint32_t i = 0; i < 32u; ++i)
+                rdram[0x1000u + i] = static_cast<uint8_t>(i);
+
+            alignas(16) uint8_t got[16];
+            _mm_store_si128(reinterpret_cast<__m128i *>(got), Ps2FastRead128(rdram.data(), 0x1004u));
+            t.Equals(got[0], static_cast<uint8_t>(0), "LQ at 0x1004 should load the quadword at 0x1000");
+            t.Equals(got[15], static_cast<uint8_t>(15), "LQ at 0x1004 should load the quadword at 0x1000");
+
+            Ps2FastWrite128(rdram.data(), 0x101Cu, _mm_set1_epi8(static_cast<char>(0xAB)));
+            t.Equals(rdram[0x1010u], static_cast<uint8_t>(0xAB), "SQ at 0x101C should store at 0x1010");
+            t.Equals(rdram[0x101Fu], static_cast<uint8_t>(0xAB), "SQ at 0x101C should store at 0x1010");
+            t.Equals(rdram[0x100Fu], static_cast<uint8_t>(15), "SQ at 0x101C should not touch the quadword below");
+        });
+
         tc.Run("translateAddress handles kseg and uncached aliases", [](TestCase &t)
         {
             PS2Memory mem;

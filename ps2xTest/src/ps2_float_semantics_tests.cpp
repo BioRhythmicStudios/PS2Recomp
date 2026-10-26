@@ -120,6 +120,18 @@ void register_ps2_float_semantics_tests()
             }
         });
 
+        tc.Run("CVT.W.S truncates toward zero and saturates", [](TestCase &t)
+        {
+            t.Equals(FPU_CVT_W_S(2.75f), 2, "2.75 should truncate to 2");
+            t.Equals(FPU_CVT_W_S(2.5f), 2, "2.5 should truncate to 2, not round to even");
+            t.Equals(FPU_CVT_W_S(-2.75f), -2, "-2.75 should truncate toward zero");
+            t.Equals(FPU_CVT_W_S(0.9999999f), 0, "values below one should give 0");
+            t.Equals(FPU_CVT_W_S(floatOf(0x00400000u)), 0, "a denormal reads as zero");
+            t.Equals(FPU_CVT_W_S(3.0e9f), INT32_MAX, "large positive values saturate");
+            t.Equals(FPU_CVT_W_S(-3.0e9f), INT32_MIN, "large negative values saturate");
+            t.Equals(FPU_CVT_W_S(floatOf(kTwoPow128)), INT32_MAX, "exponent 255 saturates");
+        });
+
         tc.Run("exponent 255 is an ordinary exponent, not Inf or NaN", [](TestCase &t)
         {
             const float twoPow128 = floatOf(kTwoPow128);
