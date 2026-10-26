@@ -2,7 +2,11 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_host_profile.h"
 #include <atomic>
+#include <cstdarg>
+#include <cstdlib>
+#include <set>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +17,65 @@
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    // PS2_GS_TEX_TRACE=1: log each distinct TEX0 setting and each distinct local-memory transfer once.
+    bool gsTexTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2_GS_TEX_TRACE") != nullptr;
+        return enabled;
+    }
+
+    void traceOnce(std::set<uint64_t> &seen, uint64_t key, const char *fmt, ...)
+    {
+        if (!seen.insert(key).second)
+            return;
+        va_list args;
+        va_start(args, fmt);
+        std::vfprintf(stderr, fmt, args);
+        va_end(args);
+    }
+
+    // PS2_GS_DRAW_TRACE=x0,y0,x1,y1: log textured draws whose vertices fall in that framebuffer rectangle,
+    // once per distinct texture/primitive state.
+    void traceDrawInRegion(const GSPrimitiveBatch &batch)
+    {
+        static const std::array<float, 4> region = []
+        {
+            std::array<float, 4> r{-1.0f, -1.0f, -1.0f, -1.0f};
+            if (const char *env = std::getenv("PS2_GS_DRAW_TRACE"))
+                std::sscanf(env, "%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3]);
+            return r;
+        }();
+        if (region[2] < 0.0f || !batch.state.prim.tme)
+            return;
+        bool inside = false;
+        for (uint8_t i = 0; i < batch.vertexCount; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            inside |= v.x >= region[0] && v.x <= region[2] && v.y >= region[1] && v.y <= region[3];
+        }
+        if (!inside)
+            return;
+        const GSDrawState &st = batch.state;
+        const GSTex0Reg &t = st.context.tex0;
+        static std::set<uint64_t> seen;
+        const uint64_t key = (static_cast<uint64_t>(t.tbp0) << 40) ^ (static_cast<uint64_t>(t.psm) << 32) ^
+                             (static_cast<uint64_t>(st.prim.type) << 28) ^ (st.prim.fst ? 1ull << 27 : 0ull) ^
+                             st.context.tex1 ^ (st.context.clamp << 1) ^ (st.context.test << 2);
+        const GSVertex &a = batch.vertices[0];
+        const GSVertex &b = batch.vertices[batch.vertexCount > 1 ? 1 : 0];
+        traceOnce(seen, key,
+                  "[gs-draw] prim=%u fst=%u abe=%u tbp=0x%X tbw=%u psm=0x%X tw=%u th=%u tcc=%u tfx=%u cbp=0x%X "
+                  "tex1=0x%llX clamp=0x%llX test=0x%llX alpha=0x%llX texsize=%ux%u linear=%u | "
+                  "v0 xy=(%.2f,%.2f) uv=(%u,%u) stq=(%.4f,%.4f,%.4f) rgba=(%u,%u,%u,%u) | "
+                  "v1 xy=(%.2f,%.2f) uv=(%u,%u) stq=(%.4f,%.4f,%.4f)\n",
+                  static_cast<unsigned>(st.prim.type), st.prim.fst, st.prim.abe, t.tbp0, t.tbw, t.psm, t.tw, t.th,
+                  t.tcc, t.tfx, t.cbp, static_cast<unsigned long long>(st.context.tex1),
+                  static_cast<unsigned long long>(st.context.clamp), static_cast<unsigned long long>(st.context.test),
+                  static_cast<unsigned long long>(st.context.alpha), st.textureWidth, st.textureHeight,
+                  st.linearFilter, a.x, a.y, a.u, a.v, a.s, a.t, a.q, a.r, a.g, a.b, a.a, b.x, b.y, b.u, b.v, b.s,
+                  b.t, b.q);
+    }
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -640,6 +703,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    ps2_host_profile::Scope profileScope(ps2_host_profile::kGs);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
@@ -1240,6 +1304,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        if (gsTexTraceEnabled())
+        {
+            static std::set<uint64_t> seen;
+            traceOnce(seen, value, "[gs-tex] tick=%llu TEX0_%d tbp=0x%X tbw=%u psm=0x%X tw=%u th=%u tcc=%u tfx=%u "
+                                   "cbp=0x%X cpsm=0x%X csm=%u csa=%u cld=%u\n",
+                      static_cast<unsigned long long>(m_privRegs ? m_privRegs->vsyncTick.load() : 0u), ci + 1,
+                      t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm, t.csa, t.cld);
+        }
         m_backend->LoadClut(t, m_texclut);
         break;
     }
@@ -1384,6 +1456,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        if (gsTexTraceEnabled())
+        {
+            static std::set<uint64_t> seen;
+            const uint64_t key = (static_cast<uint64_t>(m_bitbltbuf.dbp) << 40) ^
+                                 (static_cast<uint64_t>(m_bitbltbuf.dpsm) << 32) ^
+                                 (static_cast<uint64_t>(m_trxreg.rrw) << 16) ^ m_trxreg.rrh ^
+                                 (static_cast<uint64_t>(m_trxdir) << 62);
+            traceOnce(seen, key, "[gs-trx] tick=%llu dir=%u dbp=0x%X dbw=%u dpsm=0x%X dst=(%u,%u) size=%ux%u\n",
+                      static_cast<unsigned long long>(m_privRegs ? m_privRegs->vsyncTick.load() : 0u), m_trxdir,
+                      m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                      m_trxreg.rrw, m_trxreg.rrh);
+        }
 
         if (m_backend)
         {
@@ -1577,6 +1661,7 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        traceDrawInRegion(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
