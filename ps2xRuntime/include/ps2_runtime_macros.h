@@ -275,6 +275,19 @@ inline bool ps2_fnormal(float r)
     return (std::bit_cast<uint32_t>(r) * 2u + 0x01000000u) >= 0x02000000u;
 }
 
+inline int32_t ps2_cvt_w_s(float f)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(f);
+    if ((b & PS2_FLOAT_EXP_MASK) == 0u)
+        return 0;
+    const double d = std::trunc(ps2_to_double(f));
+    if (d >= 2147483648.0)
+        return INT32_MAX;
+    if (d < -2147483648.0)
+        return INT32_MIN;
+    return static_cast<int32_t>(d);
+}
+
 inline float ps2_fadd(float a, float b)
 {
     const float r = a + b;
@@ -453,7 +466,8 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
 
 static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    // LQ/SQ/LQC2/SQC2 ignore the low four address bits on the EE.
+    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];
@@ -526,7 +540,8 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
 
 static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    // LQ/SQ/LQC2/SQC2 ignore the low four address bits on the EE.
+    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];
@@ -853,7 +868,8 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// CVT.W.S truncates toward zero and saturates out-of-range values.
+#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
