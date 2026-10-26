@@ -1255,6 +1255,10 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
+    if (!dmac)
+    {
+        m_runtime.memory().latchIntcStatus(cause);
+    }
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
@@ -1273,6 +1277,12 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (!dmac && !matching.empty())
+    {
+        // The kernel's INTC dispatcher acknowledges a cause it delivers. A cause nobody handles
+        // (VBON while libgraph's sceGsSyncV polls it) stays latched for the guest to see.
+        m_runtime.memory().acknowledgeIntcStatus(cause);
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};

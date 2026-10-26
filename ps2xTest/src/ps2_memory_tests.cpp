@@ -2233,6 +2233,104 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
         });
 
+        tc.Run("VIF1 i-bit stalls after its command, raises INTC 5 and resumes on FBRST.STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x07u, 0u, 100u) | 0x80000000u); // MARK 100 with the i-bit
+            appendU32(packet, makeVifCmd(0x07u, 0u, 101u));               // must wait for STC
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            t.Equals(mem.readIORegister(0x10003C30u), 100u, "VIF1_MARK should read the stalled mark");
+            const uint32_t stat = mem.readIORegister(0x10003C00u);
+            t.IsTrue((stat & (1u << 6)) != 0u, "VIF1_STAT.MRK should be set by MARK");
+            t.IsTrue((stat & (1u << 11)) != 0u, "VIF1_STAT.INT should be set by the i-bit");
+            const std::vector<uint32_t> causes = mem.consumeCompletedIntcCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u), "the i-bit should queue one INTC cause");
+            if (!causes.empty())
+                t.Equals(causes[0], 5u, "VIF1 interrupts use INTC cause 5");
+
+            t.IsTrue(mem.writeIORegister(0x10003C30u, 0u), "VIF1_MARK write should succeed");
+            t.IsTrue((mem.readIORegister(0x10003C00u) & (1u << 6)) == 0u, "a CPU write to VIF1_MARK clears STAT.MRK");
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST.STC write should succeed");
+            t.Equals(mem.readIORegister(0x10003C30u), 101u, "STC should resume the stream after the stalled command");
+            t.IsTrue((mem.readIORegister(0x10003C00u) & (1u << 11)) == 0u, "STC should clear STAT.INT");
+            t.IsTrue(mem.consumeCompletedIntcCauses().empty(), "no further interrupt without another i-bit");
+        });
+
+        tc.Run("VIF1 DMA stalled by an i-bit keeps CHCR.STR until STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kSrc = 0x00024000u;
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kSrc, 0, 16u);
+            const uint32_t mark = makeVifCmd(0x07u, 0u, 100u) | 0x80000000u;
+            std::memcpy(rdram + kSrc, &mark, sizeof(mark));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, 1u), "write VIF1 QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
+            mem.processPendingTransfers();
+
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) != 0u, "a stalled VIF1 channel is still busy");
+            t.IsTrue(mem.consumeCompletedDmacCauses().empty(), "the channel must not complete while stalled");
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST.STC write should succeed");
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u, "STC lets the channel finish");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u), "the channel should complete once after STC");
+        });
+
+        tc.Run("VIF1 image continuation arrives in the next DIRECT payload", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            // DIRECT 1: an IMAGE tag for 2 qwords; the pixels follow in a separate DIRECT 2, the way
+            // texture uploads are split into setup and data packets.
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
+            appendU64(packet, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x00u, 0u, 0u)); // NOP
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u)); // DIRECT 2
+            for (uint32_t i = 0; i < 32u; ++i)
+                packet.push_back(static_cast<uint8_t>(0x80u | i)); // texels with the alpha/i-bit pattern
+            appendU32(packet, makeVifCmd(0x07u, 0u, 7u)); // MARK 7 must still decode as a command
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            t.Equals(mem.readIORegister(0x10003C30u), 7u, "the command after the image data should decode");
+            t.IsTrue(mem.consumeCompletedIntcCauses().empty(), "texel bytes must not raise VIF1 interrupts");
+            size_t imageBytes = 0u;
+            for (const auto &p : captured)
+                imageBytes += p.size();
+            t.Equals(imageBytes, static_cast<size_t>(16u + 16u + 32u), "the setup tag plus the wrapped image should reach the GIF");
+        });
+
+        tc.Run("INTC_STAT latches causes and clears them with write-one", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            mem.latchIntcStatus(2u);
+            mem.latchIntcStatus(5u);
+            t.Equals(mem.readIORegister(0x1000F000u), (1u << 2) | (1u << 5), "latched causes should read back");
+            t.IsTrue(mem.writeIORegister(0x1000F000u, 1u << 2), "INTC_STAT write should succeed");
+            t.Equals(mem.readIORegister(0x1000F000u), 1u << 5, "writing 1 clears only that cause");
+            mem.acknowledgeIntcStatus(5u);
+            t.Equals(mem.readIORegister(0x1000F000u), 0u, "the dispatcher acknowledgement clears a delivered cause");
+        });
+
         tc.Run("unaligned accesses throw", [](TestCase &t)
         {
             PS2Memory mem;

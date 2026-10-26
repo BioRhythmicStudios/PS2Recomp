@@ -325,6 +325,7 @@ bool PS2Memory::initialize(size_t ramSize)
     {
         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
         m_completedDmacCauses.clear();
+        m_completedIntcCauses.clear();
     }
     m_codeRegions.clear();
     m_path3Masked = false;
@@ -1124,6 +1125,13 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (address == kIntcStatAddress)
+    {
+        // INTC_STAT: writing 1 clears a latched cause.
+        m_ioRegisters[address] &= ~value;
+        return true;
+    }
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1231,6 +1239,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1Stalled = false;
+                m_vif1StalledData.clear();
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1238,6 +1248,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (value & 0x8u) // STC
             {
                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+                resumeStalledVif1();
             }
             break;
         case 0x10003C30u:
@@ -1802,6 +1813,8 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    if (hadVif1 && vif1IrqTraceEnabled())
+        std::fprintf(stderr, "[vif1-irq] VIF1 DMA kick (%zu transfers), stalled=%d\n", m_pendingVif1Transfers.size(), m_vif1Stalled ? 1 : 0);
     for (auto &p : m_pendingVif1Transfers)
     {
         if (!p.chainData.empty())
@@ -1864,22 +1877,10 @@ void PS2Memory::processPendingTransfers()
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
-    static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
-    static constexpr uint32_t D_STAT = 0x1000E010u;
 
     auto raiseDStatChannel = [&](uint32_t channelBit)
     {
-        uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
-        dstat |= (1u << channelBit);
-
-        const uint32_t status = dstat & 0x3FFu;
-        const uint32_t mask = (dstat >> 16) & 0x3FFu;
-        if ((status & mask) != 0u)
-            dstat |= (1u << 31);
-        else
-            dstat &= ~(1u << 31);
-
-        m_ioRegisters[D_STAT] = dstat;
+        raiseDmaChannelStatus(channelBit);
     };
 
     if (hadGif)
@@ -1898,11 +1899,55 @@ void PS2Memory::processPendingTransfers()
     }
     if (hadVif1)
     {
-        raiseDStatChannel(1u); // VIF1 channel
-        queueCompletedDmacCause(1u);
-        m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
-        m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+        // A VIF1 stalled by an i-bit has not consumed its DMA yet; the channel ends after STC.
+        if (m_vif1Stalled)
+            m_vif1DmaCompletionDeferred = true;
+        else
+            completeVif1Dma();
     }
+}
+
+void PS2Memory::raiseDmaChannelStatus(uint32_t channelBit)
+{
+    static constexpr uint32_t D_STAT = 0x1000E010u;
+    uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
+    dstat |= (1u << channelBit);
+
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask = (dstat >> 16) & 0x3FFu;
+    if ((status & mask) != 0u)
+        dstat |= (1u << 31);
+    else
+        dstat &= ~(1u << 31);
+
+    m_ioRegisters[D_STAT] = dstat;
+}
+
+void PS2Memory::completeVif1Dma()
+{
+    static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
+    m_vif1DmaCompletionDeferred = false;
+    raiseDmaChannelStatus(1u); // VIF1 channel
+    queueCompletedDmacCause(1u);
+    m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
+    m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+}
+
+void PS2Memory::resumeStalledVif1()
+{
+    if (!m_vif1Stalled)
+        return;
+    if (vif1IrqTraceEnabled())
+        std::fprintf(stderr, "[vif1-irq] STC resume, %zu bytes held\n", m_vif1StalledData.size());
+    m_vif1Stalled = false;
+    std::vector<uint8_t> rest;
+    rest.swap(m_vif1StalledData);
+    if (!rest.empty())
+        processVIF1Data(rest.data(), static_cast<uint32_t>(rest.size()));
+    if (m_gifArbiter)
+        m_gifArbiter->drain();
+    if (!m_vif1Stalled && m_vif1DmaCompletionDeferred)
+        completeVif1Dma();
 }
 
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
@@ -1916,6 +1961,32 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     std::vector<uint32_t> causes;
     causes.swap(m_completedDmacCauses);
+    return causes;
+}
+
+void PS2Memory::latchIntcStatus(uint32_t cause)
+{
+    if (cause < 32u)
+        m_ioRegisters[kIntcStatAddress] |= 1u << cause;
+}
+
+void PS2Memory::acknowledgeIntcStatus(uint32_t cause)
+{
+    if (cause < 32u)
+        m_ioRegisters[kIntcStatAddress] &= ~(1u << cause);
+}
+
+void PS2Memory::queueCompletedIntcCause(uint32_t cause)
+{
+    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+    m_completedIntcCauses.push_back(cause);
+}
+
+std::vector<uint32_t> PS2Memory::consumeCompletedIntcCauses()
+{
+    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+    std::vector<uint32_t> causes;
+    causes.swap(m_completedIntcCauses);
     return causes;
 }
 
@@ -2355,12 +2426,35 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         return stat;
     }
 
+    // VIF0/VIF1 registers: reads return the interpreter's live state (STAT.MRK/INT, MARK, ...),
+    // not the last value the CPU stored there.
+    if ((address >= 0x10003800u && address < 0x10003980u) || (address >= 0x10003C00u && address < 0x10003D80u))
+    {
+        const VIFRegisters &vif = (address >= 0x10003C00u) ? vif1_regs : vif0_regs;
+        const uint32_t offset = address & 0x1F0u;
+        static constexpr uint32_t VIFRegisters::*kVifRegs[] = {
+            &VIFRegisters::stat, &VIFRegisters::fbrst, &VIFRegisters::err, &VIFRegisters::mark,
+            &VIFRegisters::cycle, &VIFRegisters::mode, &VIFRegisters::num, &VIFRegisters::mask,
+            &VIFRegisters::code, &VIFRegisters::itops, &VIFRegisters::base, &VIFRegisters::ofst,
+            &VIFRegisters::tops, &VIFRegisters::itop, &VIFRegisters::top};
+        if ((address & 0xFu) != 0u)
+            return 0u;
+        if (offset < 0x100u)
+            return (offset / 0x10u) < 15u ? vif.*kVifRegs[offset / 0x10u] : 0u;
+        if (offset < 0x140u)
+            return vif.row[(offset - 0x100u) / 0x10u];
+        return vif.col[(offset - 0x140u) / 0x10u];
+    }
+
     if (address >= 0x10000000 && address < 0x10010000)
     {
         if (address >= 0x10008000 && address < 0x1000F000)
         {
             if ((address & 0xFF) == 0x00)
             {
+                // A VIF1 stalled on an i-bit is still transferring: its channel keeps STR.
+                if (address == 0x10009000u && m_vif1Stalled && m_vif1DmaCompletionDeferred)
+                    return m_ioRegisters[address];
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

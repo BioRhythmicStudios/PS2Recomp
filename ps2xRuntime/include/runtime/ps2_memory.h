@@ -216,6 +216,8 @@ static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment 
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
 // PS2 VIF (VPU Interface) registers
+bool vif1IrqTraceEnabled(); // PS2_VIF1_IRQ_TRACE set: log VIF1 i-bit stalls and STC resumes
+
 struct VIFRegisters
 {
     uint32_t stat;   // Status
@@ -345,6 +347,13 @@ public:
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
+    std::vector<uint32_t> consumeCompletedIntcCauses();
+
+    // INTC_STAT (0x1000F000): causes latch here; the kernel dispatcher acknowledges the ones it
+    // delivers, so a masked cause (VBON for sceGsSyncV polling) stays set until the guest clears it.
+    static constexpr uint32_t kIntcStatAddress = 0x1000F000u;
+    void latchIntcStatus(uint32_t cause);
+    void acknowledgeIntcStatus(uint32_t cause);
 
     int pollDmaRegisters();
 
@@ -409,6 +418,9 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    bool m_vif1Stalled = false;            // stopped by an i-bit, waiting for FBRST.STC
+    bool m_vif1DmaCompletionDeferred = false;
+    std::vector<uint8_t> m_vif1StalledData;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -423,6 +435,7 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+    std::vector<uint32_t> m_completedIntcCauses;
 
     struct CodeRegion
     {
@@ -452,6 +465,11 @@ public:
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
+    void queueCompletedIntcCause(uint32_t cause);
+    void raiseDmaChannelStatus(uint32_t channelBit);
+    void completeVif1Dma();
+    void resumeStalledVif1();
+    uint32_t submitPendingPath2Image(const uint8_t *data, uint32_t availableQw);
 };
 
 #endif // PS2_MEMORY_H

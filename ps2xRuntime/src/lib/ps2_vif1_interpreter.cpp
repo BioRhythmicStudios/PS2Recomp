@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -29,6 +31,24 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    // Opcodes the VIF1 command decoder accepts (VIF command reference); anything else is data.
+    bool isVif1Opcode(uint32_t word)
+    {
+        const uint8_t op = static_cast<uint8_t>((word >> 24) & 0x7Fu);
+        if (op <= 0x07u)
+            return true; // NOP STCYCL OFFSET BASE ITOP STMOD MSKPATH3 MARK
+        switch (op)
+        {
+        case 0x10u: case 0x11u: case 0x13u: // FLUSHE FLUSH FLUSHA
+        case 0x14u: case 0x15u: case 0x17u: // MSCAL MSCALF MSCNT
+        case 0x20u: case 0x30u: case 0x31u: // STMASK STROW STCOL
+        case 0x4Au: case 0x50u: case 0x51u: // MPG DIRECT DIRECTHL
+            return true;
+        default:
+            return op >= 0x60u; // UNPACK
+        }
+    }
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -295,16 +315,89 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+namespace
+{
+    struct Vif1CmdRecord
+    {
+        uint32_t cmd, pos, size;
+    };
+    Vif1CmdRecord g_vif1CmdRing[8] = {};
+    uint64_t g_vif1CmdRingPos = 0;
+
+    void dumpVif1CmdRing()
+    {
+        for (uint64_t i = g_vif1CmdRingPos > 8 ? g_vif1CmdRingPos - 8 : 0; i < g_vif1CmdRingPos; ++i)
+        {
+            const Vif1CmdRecord &r = g_vif1CmdRing[i % 8];
+            std::fprintf(stderr, "[vif1-irq]   cmd 0x%08X at %u/%u\n", r.cmd, r.pos, r.size);
+        }
+    }
+}
+
+uint32_t PS2Memory::submitPendingPath2Image(const uint8_t *data, uint32_t availableQw)
+{
+    // Wrap the next part of a PATH2 IMAGE transfer in its own IMAGE GIFtag (EOP on the last part).
+    const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+    if (chunkQw == 0u)
+        return 0u;
+    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+    const uint64_t imageTag =
+        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+        ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+        (static_cast<uint64_t>(kGifFmtImage) << 58);
+    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+    std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
+    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+
+    m_vif1PendingPath2ImageQwc -= chunkQw;
+    if (m_vif1PendingPath2ImageQwc == 0u)
+        m_vif1PendingPath2DirectHl = false;
+    return chunkQw;
+}
+
+bool vif1IrqTraceEnabled()
+{
+    static const bool enabled = std::getenv("PS2_VIF1_IRQ_TRACE") != nullptr;
+    return enabled;
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
 
+    // A stalled VIF1 holds everything that arrives until FBRST.STC resumes it.
+    if (m_vif1Stalled)
+    {
+        if (vif1IrqTraceEnabled())
+            std::fprintf(stderr, "[vif1-irq] held %u more bytes while stalled\n", sizeBytes);
+        m_vif1StalledData.insert(m_vif1StalledData.end(), data, data + sizeBytes);
+        return;
+    }
+
     uint32_t pos = 0;
+    bool stallAfterCommand = false;
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        // VIF i-bit: the command carrying it completes, then VIF1 stalls with STAT.INT
+        // set and raises INTC VIF1 (cause 5). The rest of the stream waits for STC.
+        if (stallAfterCommand)
+        {
+            if (vif1IrqTraceEnabled())
+                std::fprintf(stderr, "[vif1-irq] stall code=0x%08X mark=%u held=%u bytes\n", vif1_regs.code,
+                             vif1_regs.mark, sizeBytes - pos);
+            if (vif1IrqTraceEnabled())
+                dumpVif1CmdRing();
+            m_vif1Stalled = true;
+            m_vif1StalledData.assign(data + pos, data + sizeBytes);
+            queueCompletedIntcCause(5u);
+            return;
+        }
+
+        uint32_t nextWord = 0u;
+        std::memcpy(&nextWord, data + pos, 4);
+        if (m_vif1PendingPath2ImageQwc != 0u && !isVif1Opcode(nextWord))
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
@@ -312,27 +405,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 break;
             }
 
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
+            pos += submitPendingPath2Image(data + pos, availableQw) * 16u;
             continue;
         }
 
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
+        if (vif1IrqTraceEnabled())
+        {
+            g_vif1CmdRing[g_vif1CmdRingPos % 8] = {cmd, pos, sizeBytes};
+            ++g_vif1CmdRingPos;
+        }
         pos += 4;
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
@@ -343,8 +426,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
-        if (irq)
+        if (irq && (vif1_regs.err & 0x1u) == 0u) // ERR.MII masks the i-bit
+        {
             vif1_regs.stat |= (1u << 11); // INT
+            stallAfterCommand = true;
+        }
 
         if (opcode == VIF_NOP)
         {
@@ -495,6 +581,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            uint32_t imageQw = 0u;
+            if (qwCount > 0 && m_vif1PendingPath2ImageQwc != 0u)
+            {
+                imageQw = submitPendingPath2Image(data + pos, qwCount);
+                pos += imageQw * 16u;
+                qwCount -= imageQw;
+            }
+
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
@@ -503,6 +597,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
                 if (pendingImageQw != 0u)
                 {
+                    if (vif1IrqTraceEnabled())
+                    {
+                        const uint32_t after = pos + qwCount * 16u;
+                        uint32_t w[4] = {};
+                        if (after + 16u <= sizeBytes)
+                            std::memcpy(w, data + after, 16u);
+                        std::fprintf(stderr, "[vif1-irq] DIRECT %u leaves %u image qw pending; next words %08X %08X %08X %08X\n",
+                                     qwCount, pendingImageQw, w[0], w[1], w[2], w[3]);
+                    }
                     m_vif1PendingPath2ImageQwc = pendingImageQw;
                     m_vif1PendingPath2DirectHl = directHl;
                 }
@@ -779,5 +882,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             continue;
         }
+    }
+
+    if (stallAfterCommand)
+    {
+        if (vif1IrqTraceEnabled())
+            std::fprintf(stderr, "[vif1-irq] stall code=0x%08X mark=%u held=0 bytes (end of data)\n",
+                         vif1_regs.code, vif1_regs.mark);
+        m_vif1Stalled = true;
+        m_vif1StalledData.clear();
+        queueCompletedIntcCause(5u);
     }
 }
