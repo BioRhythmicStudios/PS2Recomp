@@ -967,6 +967,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
+            if (m_gsPrivWriteCallback)
+                m_gsPrivWriteCallback(regOff);
         }
         return;
     }
@@ -1024,6 +1026,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            if (m_gsPrivWriteCallback)
+                m_gsPrivWriteCallback(regOff);
         }
         return;
     }
@@ -1182,6 +1186,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
             *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            if (m_gsPrivWriteCallback)
+                m_gsPrivWriteCallback(regOff);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;

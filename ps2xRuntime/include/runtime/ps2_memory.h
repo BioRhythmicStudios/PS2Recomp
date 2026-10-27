@@ -325,6 +325,9 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
     const Vu1MscntCallback &vu1MscntCallback() const { return m_vu1MscntCallback; }
+    // Called after the EE writes a privileged GS register other than CSR (regOffset from 0x12000000).
+    using GsPrivWriteCallback = std::function<void(uint32_t regOffset)>;
+    void setGsPrivWriteCallback(GsPrivWriteCallback cb) { m_gsPrivWriteCallback = std::move(cb); }
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -412,6 +415,7 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+    GsPrivWriteCallback m_gsPrivWriteCallback;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

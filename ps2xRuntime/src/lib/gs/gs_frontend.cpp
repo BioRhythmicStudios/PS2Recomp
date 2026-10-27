@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_async_queue.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_host_profile.h"
@@ -187,6 +188,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 
 void GS::reset()
 {
+    syncWithQueuedWork("reset");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
@@ -571,13 +573,26 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     GSPresentationRequest request{};
     if (!m_privRegs)
         return request;
-    request.pmode = m_privRegs->pmode;
-    request.smode2 = m_privRegs->smode2;
-    request.dispfb1 = m_privRegs->dispfb1;
-    request.display1 = m_privRegs->display1;
-    request.dispfb2 = m_privRegs->dispfb2;
-    request.display2 = m_privRegs->display2;
-    request.bgcolor = m_privRegs->bgcolor;
+    if (m_useQueuedDisplayRegs)
+    {
+        request.pmode = m_queuedDisplayRegs.pmode;
+        request.smode2 = m_queuedDisplayRegs.smode2;
+        request.dispfb1 = m_queuedDisplayRegs.dispfb1;
+        request.display1 = m_queuedDisplayRegs.display1;
+        request.dispfb2 = m_queuedDisplayRegs.dispfb2;
+        request.display2 = m_queuedDisplayRegs.display2;
+        request.bgcolor = m_queuedDisplayRegs.bgcolor;
+    }
+    else
+    {
+        request.pmode = m_privRegs->pmode;
+        request.smode2 = m_privRegs->smode2;
+        request.dispfb1 = m_privRegs->dispfb1;
+        request.display1 = m_privRegs->display1;
+        request.dispfb2 = m_privRegs->dispfb2;
+        request.display2 = m_privRegs->display2;
+        request.bgcolor = m_privRegs->bgcolor;
+    }
     request.vsyncTick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
     request.contextFrames[0] = m_ctx[0].frame;
     request.contextFrames[1] = m_ctx[1].frame;
@@ -631,6 +646,7 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = hasFrame;
     }
+    m_presentationGeneration.fetch_add(1, std::memory_order_acq_rel);
 
     if (hasFrame)
     {
@@ -806,6 +822,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    syncWithQueuedWork("native packed GIF packet");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
@@ -851,6 +868,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    syncWithQueuedWork("native image upload");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
@@ -1130,6 +1148,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     m_streamStats.directRegWrites.fetch_add(1, std::memory_order_relaxed);
+    syncWithQueuedWork("register write outside the GIF stream");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1710,12 +1729,14 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    syncWithQueuedWork("framebuffer clear");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    syncWithQueuedWork("framebuffer clear");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
@@ -1723,8 +1744,42 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     m_streamStats.localToHostReads.fetch_add(1, std::memory_order_relaxed);
+    syncWithQueuedWork("local-to-host readback");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+}
+
+void GS::setAsyncQueue(GSAsyncQueue *queue)
+{
+    if (m_asyncQueue && !queue)
+        m_asyncQueue->waitIdle();
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_asyncQueue = queue;
+    if (!queue)
+        m_useQueuedDisplayRegs = false;
+}
+
+void GS::setQueuedDisplayRegs(const GSDisplayRegs &regs)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_queuedDisplayRegs = regs;
+    m_useQueuedDisplayRegs = true;
+}
+
+void GS::waitForQueuedWork()
+{
+    if (m_asyncQueue)
+        m_asyncQueue->waitIdle();
+}
+
+void GS::syncWithQueuedWork(const char *what)
+{
+    if (!m_asyncQueue || m_asyncQueue->onWorkerThread())
+        return;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[gs-async] %s outside the GIF stream: waiting for the GS worker (logged once)\n", what);
+    m_asyncQueue->waitIdle();
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)

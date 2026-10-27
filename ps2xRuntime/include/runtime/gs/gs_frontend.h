@@ -112,6 +112,15 @@ struct GSStreamStats
     std::atomic<uint64_t> presentationLatches{0};
 };
 
+// The privileged display registers that presentation reads, as one snapshot. With an asynchronous GS the worker
+// presents from the snapshot at its own position in the stream instead of from the live registers.
+struct GSDisplayRegs
+{
+    uint64_t pmode = 0, smode2 = 0, dispfb1 = 0, display1 = 0, dispfb2 = 0, display2 = 0, bgcolor = 0;
+};
+
+class GSAsyncQueue;
+
 class GS
 {
 public:
@@ -157,6 +166,16 @@ public:
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
     const GSStreamStats &streamStats() const { return m_streamStats; }
+
+    // Asynchronous GS support (GSAsyncQueue). setAsyncQueue(nullptr) returns to inline operation.
+    void setAsyncQueue(GSAsyncQueue *queue);
+    // Called by the GS worker when it reaches a display-register snapshot in the stream.
+    void setQueuedDisplayRegs(const GSDisplayRegs &regs);
+    // Blocks until queued GS work is processed (no-op when the GS runs inline or on the worker itself).
+    void waitForQueuedWork();
+    bool asyncEnabled() const { return m_asyncQueue != nullptr; }
+    // Incremented every time a presentation frame is latched.
+    uint64_t hostPresentationGeneration() const { return m_presentationGeneration.load(std::memory_order_acquire); }
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -249,6 +268,12 @@ private:
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
     GSStreamStats m_streamStats;
+    GSAsyncQueue *m_asyncQueue = nullptr;
+    GSDisplayRegs m_queuedDisplayRegs{};
+    bool m_useQueuedDisplayRegs = false;
+    std::atomic<uint64_t> m_presentationGeneration{0};
+    // Entry points the game thread may call outside the GIF stream: with a GS worker they wait for it first.
+    void syncWithQueuedWork(const char *what);
 
     static constexpr size_t kDebugHistoryCapacity = 512;
     std::array<GSDebugHistoryEntry, kDebugHistoryCapacity> m_debugHistory{};

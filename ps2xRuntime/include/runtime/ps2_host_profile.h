@@ -14,7 +14,8 @@ namespace ps2_host_profile
         kEe = 0,
         kVu1,
         kGs,
-        kPresent, // main thread: latching and converting the displayed frame
+        kPresent, // latching and converting the displayed frame (main thread, or the GS worker when asynchronous)
+        kGsWait,  // game thread blocked on the GS worker (queue full, or a synchronous GS entry point)
         kCategoryCount
     };
 

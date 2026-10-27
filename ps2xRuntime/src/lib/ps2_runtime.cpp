@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_async_queue.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_profile.h"
 #include "ThreadNaming.h"
@@ -390,11 +391,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    // With a GS worker (PS2X_GS_THREAD=1) the worker latches each flip at its place in the stream; the presenter
+    // only picks up a newly latched frame. Inline, the presenter latches once per VBlank as before.
+    const bool asyncGs = rt->gs().asyncEnabled();
+    const uint64_t currentTick = asyncGs ? rt->gs().hostPresentationGeneration() : rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!asyncGs)
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -2546,6 +2551,44 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
+    // PS2X_GS_THREAD=1: GS work runs on its own thread (GS_THREADING_PLAN.md). Headless runs stay inline.
+    std::unique_ptr<GSAsyncQueue> gsQueue;
+    if (const char *gsThread = std::getenv("PS2X_GS_THREAD"); gsThread && gsThread[0] == '1')
+    {
+        constexpr size_t kGsQueueBytes = 4u * 1024u * 1024u; // about three 3D frames of Maximo's GIF traffic
+        gsQueue = std::make_unique<GSAsyncQueue>(m_gs, kGsQueueBytes);
+        GSAsyncQueue *queue = gsQueue.get();
+        const auto displayRegs = [this]()
+        {
+            const GSRegisters &regs = m_memory.gs();
+            GSDisplayRegs snapshot;
+            snapshot.pmode = regs.pmode;
+            snapshot.smode2 = regs.smode2;
+            snapshot.dispfb1 = regs.dispfb1;
+            snapshot.display1 = regs.display1;
+            snapshot.dispfb2 = regs.dispfb2;
+            snapshot.display2 = regs.display2;
+            snapshot.bgcolor = regs.bgcolor;
+            return snapshot;
+        };
+        m_gs.setAsyncQueue(queue);
+        queue->submitDisplayRegs(displayRegs());
+        m_gifArbiter.setTakePacketFn([queue](std::vector<uint8_t> &&bytes)
+                                     { queue->submitPacket(std::move(bytes)); });
+        m_memory.setGsPrivWriteCallback([queue, displayRegs](uint32_t regOffset)
+                                        {
+            // PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2 and BGCOLOR: the registers presentation reads.
+            switch (regOffset)
+            {
+            case 0x00u: case 0x20u: case 0x70u: case 0x80u: case 0x90u: case 0xA0u: case 0xE0u:
+                queue->submitDisplayRegs(displayRegs());
+                break;
+            default:
+                break;
+            } });
+        RUNTIME_LOG("[run] GS worker thread enabled (PS2X_GS_THREAD=1)");
+    }
+
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
@@ -2667,6 +2710,14 @@ void PS2Runtime::run()
     if (gameThread.joinable())
     {
         gameThread.join();
+    }
+    if (gsQueue)
+    {
+        m_gifArbiter.setTakePacketFn(nullptr);
+        m_memory.setGsPrivWriteCallback(nullptr);
+        m_gs.setAsyncQueue(nullptr); // waits for the worker to drain
+        gsQueue->stop();
+        gsQueue.reset();
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)

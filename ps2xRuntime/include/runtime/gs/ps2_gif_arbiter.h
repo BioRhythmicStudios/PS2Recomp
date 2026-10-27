@@ -29,6 +29,10 @@ public:
     explicit GifArbiter(ProcessPacketFn processFn);
 
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    // When set, drain() hands each packet's bytes over instead of calling the process function (used to queue
+    // packets for a GS worker without copying them again). Arbitration order is unchanged.
+    using TakePacketFn = std::function<void(std::vector<uint8_t> &&)>;
+    void setTakePacketFn(TakePacketFn fn) { m_takeFn = std::move(fn); }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -37,6 +41,7 @@ public:
 
 private:
     ProcessPacketFn m_processFn;
+    TakePacketFn m_takeFn;
     std::vector<GifArbiterPacket> m_queue;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);

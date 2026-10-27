@@ -57,7 +57,10 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            if (m_takeFn)
+                m_takeFn(std::move(pkt.data));
+            else
+                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
     m_queue.clear();
