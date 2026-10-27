@@ -36,8 +36,8 @@ namespace
         va_end(args);
     }
 
-    // PS2_GS_DRAW_TRACE=x0,y0,x1,y1: log textured draws whose vertices fall in that framebuffer rectangle,
-    // once per distinct texture/primitive state.
+    // PS2_GS_DRAW_TRACE=x0,y0,x1,y1: log draws with a vertex in that framebuffer rectangle (window
+    // coordinates, i.e. after XYOFFSET), once per distinct texture/primitive/target state.
     void traceDrawInRegion(const GSPrimitiveBatch &batch)
     {
         static const std::array<float, 4> region = []
@@ -47,13 +47,15 @@ namespace
                 std::sscanf(env, "%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3]);
             return r;
         }();
-        if (region[2] < 0.0f || !batch.state.prim.tme)
+        if (region[2] < 0.0f)
             return;
+        const float ofx = static_cast<float>(batch.state.context.xyoffset.ofx >> 4);
+        const float ofy = static_cast<float>(batch.state.context.xyoffset.ofy >> 4);
         bool inside = false;
         for (uint8_t i = 0; i < batch.vertexCount; ++i)
         {
-            const GSVertex &v = batch.vertices[i];
-            inside |= v.x >= region[0] && v.x <= region[2] && v.y >= region[1] && v.y <= region[3];
+            const float x = batch.vertices[i].x - ofx, y = batch.vertices[i].y - ofy;
+            inside |= x >= region[0] && x <= region[2] && y >= region[1] && y <= region[3];
         }
         if (!inside)
             return;
@@ -62,14 +64,19 @@ namespace
         static std::set<uint64_t> seen;
         const uint64_t key = (static_cast<uint64_t>(t.tbp0) << 40) ^ (static_cast<uint64_t>(t.psm) << 32) ^
                              (static_cast<uint64_t>(st.prim.type) << 28) ^ (st.prim.fst ? 1ull << 27 : 0ull) ^
-                             st.context.tex1 ^ (st.context.clamp << 1) ^ (st.context.test << 2);
+                             st.context.tex1 ^ (st.context.clamp << 1) ^ (st.context.test << 2) ^
+                             (static_cast<uint64_t>(st.context.frame.fbp) << 48) ^ (st.prim.tme ? 1ull << 26 : 0ull);
         const GSVertex &a = batch.vertices[0];
         const GSVertex &b = batch.vertices[batch.vertexCount > 1 ? 1 : 0];
         traceOnce(seen, key,
-                  "[gs-draw] prim=%u fst=%u abe=%u tbp=0x%X tbw=%u psm=0x%X tw=%u th=%u tcc=%u tfx=%u cbp=0x%X "
+                  "[gs-draw] fbp=0x%X zbp=0x%X zmsk=%u fbmsk=0x%X ofs=(%u,%u) sc=(%u,%u)-(%u,%u) tme=%u "
+                  "prim=%u fst=%u abe=%u tbp=0x%X tbw=%u psm=0x%X tw=%u th=%u tcc=%u tfx=%u cbp=0x%X "
                   "tex1=0x%llX clamp=0x%llX test=0x%llX alpha=0x%llX texsize=%ux%u linear=%u | "
                   "v0 xy=(%.2f,%.2f) uv=(%u,%u) stq=(%.4f,%.4f,%.4f) rgba=(%u,%u,%u,%u) | "
                   "v1 xy=(%.2f,%.2f) uv=(%u,%u) stq=(%.4f,%.4f,%.4f)\n",
+                  st.context.frame.fbp, st.context.zbuf.zbp, st.context.zbuf.zmask ? 1u : 0u, st.context.frame.fbmsk,
+                  st.context.xyoffset.ofx >> 4, st.context.xyoffset.ofy >> 4, st.context.scissor.x0,
+                  st.context.scissor.y0, st.context.scissor.x1, st.context.scissor.y1, st.prim.tme ? 1u : 0u,
                   static_cast<unsigned>(st.prim.type), st.prim.fst, st.prim.abe, t.tbp0, t.tbw, t.psm, t.tw, t.th,
                   t.tcc, t.tfx, t.cbp, static_cast<unsigned long long>(st.context.tex1),
                   static_cast<unsigned long long>(st.context.clamp), static_cast<unsigned long long>(st.context.test),
