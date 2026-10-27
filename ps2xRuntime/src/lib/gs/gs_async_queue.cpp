@@ -1,8 +1,11 @@
 #include "runtime/gs/gs_async_queue.h"
+#include "runtime/gs/gs_cpu_profile.h"
 
 #include "runtime/ps2_host_profile.h"
 
 #include <cfenv>
+#include <cstdio>
+#include <cstdlib>
 
 GSAsyncQueue::GSAsyncQueue(GS &gs, size_t maxQueuedBytes)
     : m_gs(gs), m_maxQueuedBytes(maxQueuedBytes)
@@ -78,6 +81,33 @@ void GSAsyncQueue::stop()
 
 void GSAsyncQueue::latchPendingFlip()
 {
+    if (gs_cpu_profile::primitiveEnabled())
+    {
+        static uint64_t flip = 0;
+        static uint64_t begin = 0, end = UINT64_MAX;
+        static const bool parsed = [] {
+            if (const char *range = std::getenv("PS2_GS_PRIM_RANGE"))
+                std::sscanf(range, "%llu:%llu", &begin, &end);
+            return true;
+        }();
+        (void)parsed;
+        ++flip;
+        const auto stats = gs_cpu_profile::takePrimitives();
+        if (flip >= begin && flip < end)
+        {
+            for (unsigned type = 0; type < 3; ++type)
+                for (unsigned bucket = 0; bucket < 7; ++bucket)
+                {
+                    const auto &b = stats.bins[type][bucket];
+                    if (b.count)
+                        std::fprintf(stderr, "[gs-prim] flip=%llu type=%u boxBucket=%u draws=%llu boxPixels=%llu covered=%llu timeNs=%llu textured=%llu blended=%llu\n",
+                                     static_cast<unsigned long long>(flip), type, bucket,
+                                     static_cast<unsigned long long>(b.count), static_cast<unsigned long long>(b.boxPixels),
+                                     static_cast<unsigned long long>(b.coveredPixels), static_cast<unsigned long long>(b.nanoseconds),
+                                     static_cast<unsigned long long>(b.textured), static_cast<unsigned long long>(b.blended));
+                }
+        }
+    }
     // The presenter latched in the default rounding mode; so does the worker.
     const int roundingMode = std::fegetround();
     if (roundingMode != FE_TONEAREST)

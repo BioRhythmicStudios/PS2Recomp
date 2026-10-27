@@ -23,6 +23,26 @@ using namespace GSInternal;
 namespace gs_cpu_profile
 {
     static thread_local Snapshot s_stats;
+    static thread_local PrimitiveSnapshot s_primitives;
+    void recordPrimitive(unsigned type, uint64_t boxPixels, uint64_t coveredPixels,
+                         bool textured, bool blended, uint64_t nanoseconds)
+    {
+        const unsigned bucket = boxPixels == 0 ? 0 : boxPixels <= 16 ? 1 : boxPixels <= 64 ? 2 :
+                                boxPixels <= 256 ? 3 : boxPixels <= 1024 ? 4 : boxPixels <= 4096 ? 5 : 6;
+        auto &bin = s_primitives.bins[std::min(type, 2u)][bucket];
+        ++bin.count;
+        bin.nanoseconds += nanoseconds;
+        bin.boxPixels += boxPixels;
+        bin.coveredPixels += coveredPixels;
+        bin.textured += textured;
+        bin.blended += blended;
+    }
+    PrimitiveSnapshot takePrimitives()
+    {
+        PrimitiveSnapshot result = s_primitives;
+        s_primitives = {};
+        return result;
+    }
     uint64_t now()
     {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -65,6 +85,40 @@ namespace gs_cpu_profile
 
 namespace
 {
+    uint64_t countTriangleCoverage(const GSPrimitiveBatch &batch)
+    {
+        const auto &ctx = batch.state.context;
+        const auto &v0 = batch.vertices[0], &v1 = batch.vertices[1], &v2 = batch.vertices[2];
+        const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
+        const float fx0 = v0.x - static_cast<float>(ofx), fy0 = v0.y - static_cast<float>(ofy);
+        const float fx1 = v1.x - static_cast<float>(ofx), fy1 = v1.y - static_cast<float>(ofy);
+        const float fx2 = v2.x - static_cast<float>(ofx), fy2 = v2.y - static_cast<float>(ofy);
+        const int minX = std::max(static_cast<int>(std::floor(std::min({fx0, fx1, fx2}))), static_cast<int>(ctx.scissor.x0));
+        const int maxX = std::min(static_cast<int>(std::ceil(std::max({fx0, fx1, fx2}))), static_cast<int>(ctx.scissor.x1));
+        const int minY = std::max(static_cast<int>(std::floor(std::min({fy0, fy1, fy2}))), static_cast<int>(ctx.scissor.y0));
+        const int maxY = std::min(static_cast<int>(std::ceil(std::max({fy0, fy1, fy2}))), static_cast<int>(ctx.scissor.y1));
+        if (maxX < minX || maxY < minY)
+            return 0;
+        const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+        if (std::fabs(denom) < 0.001f)
+            return 0;
+        const float winding = denom < 0.0f ? -1.0f : 1.0f;
+        const float invAbsDenom = 1.0f / std::fabs(denom);
+        uint64_t covered = 0;
+        for (int y = minY; y <= maxY; ++y)
+        {
+            const float py = static_cast<float>(y) + 0.5f;
+            for (int x = minX; x <= maxX; ++x)
+            {
+                const float px = static_cast<float>(x) + 0.5f;
+                const float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+                const float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+                const float w2 = 1.0f - w0 - w1;
+                covered += w0 >= -1.0e-4f && w1 >= -1.0e-4f && w2 >= -1.0e-4f;
+            }
+        }
+        return covered;
+    }
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -884,6 +938,41 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         }
     });
 
+    const bool primitiveProfile = gs_cpu_profile::primitiveEnabled();
+    uint64_t boxPixels = 0;
+    unsigned profileType = 2;
+    if (primitiveProfile)
+    {
+        const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
+        int x0 = 0, x1 = -1, y0 = 0, y1 = -1;
+        if (state.prim.type == GS_PRIM_SPRITE)
+        {
+            profileType = 1;
+            x0 = std::min(static_cast<int>(batch.vertices[0].x), static_cast<int>(batch.vertices[1].x)) - ofx;
+            x1 = x0 + std::max(1, std::abs(static_cast<int>(batch.vertices[1].x) -
+                                            static_cast<int>(batch.vertices[0].x))) - 1;
+            y0 = std::min(static_cast<int>(batch.vertices[0].y), static_cast<int>(batch.vertices[1].y)) - ofy;
+            y1 = y0 + std::max(1, std::abs(static_cast<int>(batch.vertices[1].y) -
+                                            static_cast<int>(batch.vertices[0].y))) - 1;
+        }
+        else if (state.prim.type == GS_PRIM_TRIANGLE || state.prim.type == GS_PRIM_TRISTRIP ||
+                 state.prim.type == GS_PRIM_TRIFAN)
+        {
+            profileType = 0;
+            const auto &a = batch.vertices[0], &b = batch.vertices[1], &c = batch.vertices[2];
+            x0 = static_cast<int>(std::floor(std::min({a.x, b.x, c.x}) - ofx));
+            x1 = static_cast<int>(std::ceil(std::max({a.x, b.x, c.x}) - ofx));
+            y0 = static_cast<int>(std::floor(std::min({a.y, b.y, c.y}) - ofy));
+            y1 = static_cast<int>(std::ceil(std::max({a.y, b.y, c.y}) - ofy));
+        }
+        x0 = std::max(x0, static_cast<int>(ctx.scissor.x0));
+        x1 = std::min(x1, static_cast<int>(ctx.scissor.x1));
+        y0 = std::max(y0, static_cast<int>(ctx.scissor.y0));
+        y1 = std::min(y1, static_cast<int>(ctx.scissor.y1));
+        if (x1 >= x0 && y1 >= y0)
+            boxPixels = static_cast<uint64_t>(x1 - x0 + 1) * static_cast<uint64_t>(y1 - y0 + 1);
+    }
+    const uint64_t primitiveStart = primitiveProfile ? gs_cpu_profile::now() : 0;
     switch (state.prim.type)
     {
     case GS_PRIM_SPRITE:
@@ -909,6 +998,14 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
     default:
         break;
+    }
+    if (primitiveProfile)
+    {
+        const uint64_t drawNs = gs_cpu_profile::now() - primitiveStart;
+        const uint64_t covered = profileType == 0 ? countTriangleCoverage(batch) :
+                                 profileType == 1 ? boxPixels : 0;
+        gs_cpu_profile::recordPrimitive(profileType, boxPixels, covered,
+                                        state.prim.tme, state.prim.abe, drawNs);
     }
 }
 
