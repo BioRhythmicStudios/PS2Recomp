@@ -932,13 +932,16 @@ void register_ps2_runtime_expansion_tests()
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
             ctx.pc = 0x0010B470u;
+            alignas(16) const uint8_t q[16] = {1};
+            runtime.memory().write128(0x10007010u, _mm_load_si128(reinterpret_cast<const __m128i *>(q)));
 
             ps2_stubs::sceIpuInit(rdram.data(), &ctx, &runtime);
 
             t.IsFalse(runtime.isStopRequested(),
                       "sceIpuInit should tolerate the missing optional SetD4 helper");
-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
-                     "sceIpuInit should still program IPU_CTRL");
+            // IPU_CTRL.RST self-clears; the reset is visible as an emptied input FIFO (IFC = 0).
+            t.Equals(runtime.memory().read32(0x10002010u), 0u,
+                     "sceIpuInit should still program IPU_CTRL (reset: FIFO empty, RST not latched)");
             t.Equals(runtime.memory().read32(0x10002000u), 0u,
                      "sceIpuInit should leave IPU_CMD reset after initialization");
         });
@@ -956,6 +959,8 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context context{};
             context.pc = kIpuInitMainPc;
+            alignas(16) const uint8_t q[16] = {1};
+            runtime.memory().write128(0x10007010u, _mm_load_si128(reinterpret_cast<const __m128i *>(q)));
             runtime.eeScheduler().reset(rdram.data(), context);
             runtime.eeScheduler().run();
 
@@ -965,8 +970,8 @@ void register_ps2_runtime_expansion_tests()
                      "the invocation should receive the SetD4 enable argument");
             t.Equals(gIpuInitResult.load(std::memory_order_acquire), 0,
                      "the HLE completion should resume the preserved base context with success");
-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
-                     "IPU initialization should finish only after the guest invocation completes");
+            t.Equals(runtime.memory().read32(0x10002010u), 0u,
+                     "IPU initialization should finish only after the guest invocation completes (IPU reset)");
         });
 
         tc.Run("sprintf consumes EE varargs from a2 a3 t0 and preserves width formatting", [](TestCase &t)
@@ -1520,6 +1525,21 @@ void register_ps2_runtime_expansion_tests()
             std::vector<const char *> errors;
             const bool ok = ps2_ipu::verifyTables(errors);
             t.IsTrue(ok, errors.empty() ? "table check" : errors.front());
+        });
+
+        tc.Run("IPU_CTRL RST self-clears so read-modify-writes keep the FIFO", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "memory should initialize");
+            alignas(16) const uint8_t q[16] = {0x00, 0x00, 0x01, 0xB3};
+            mem.write128(0x10007010u, _mm_load_si128(reinterpret_cast<const __m128i *>(q)));
+            mem.write32(0x10002010u, 0x40000000u); // RST
+            t.Equals(mem.read32(0x10002010u), 0u, "RST should empty the FIFO and not stay set");
+            mem.write128(0x10007010u, _mm_load_si128(reinterpret_cast<const __m128i *>(q)));
+            mem.write32(0x10002010u, mem.read32(0x10002010u) | 0x00800000u); // set MP1 as the MPEG library does
+            t.Equals(mem.read32(0x10002010u), 0x00800000u, "MP1 should be set and RST clear");
+            mem.write32(0x10002000u, 0x40000000u); // FDEC FB=0
+            t.Equals(mem.read64(0x10002000u), 0x000001B3ull, "a read-modify-write should keep the queued qword");
         });
 
         tc.Run("IPU FDEC peeks the input FIFO and advances IPU_BP by FB", [](TestCase &t)

@@ -182,8 +182,9 @@ void Ps2Ipu::writeRegister32(uint32_t address, uint32_t value)
                 std::fprintf(stderr, "[ipu] reset (ctrl=0x%08X)\n", value);
             reset();
         }
-        // RST reads back as last written (PCSX2 keeps it in IPU_CTRL too).
-        m_ctrl = (m_ctrl & ~(kCtrlWritable | kCtrlRst)) | (value & (kCtrlWritable | kCtrlRst));
+        // RST self-clears (PCSX2's ipuSoftReset masks it out too). Latching it is wrong: the MPEG library
+        // read-modify-writes IPU_CTRL to set MP1/PCT, and a latched RST would reset the FIFO and BP each time.
+        m_ctrl = (m_ctrl & ~kCtrlWritable) | (value & kCtrlWritable);
         m_state->intraDcPrecision = (value >> 16) & 3u;
         m_state->alternateScan = (value >> 20) & 1u;
         m_state->intraVlcFormat = (value >> 21) & 1u;
