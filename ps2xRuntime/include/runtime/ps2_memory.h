@@ -6,6 +6,7 @@
 #include <array>
 #include <functional>
 #include <vector>
+#include <memory>
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
@@ -260,6 +261,8 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+class Ps2Ipu;
+
 class PS2Memory
 {
 public:
@@ -393,6 +396,7 @@ public:
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    std::unique_ptr<Ps2Ipu> m_ipu; // IPU registers, FIFOs and DMA channels 3/4
 
     // Registers
     GSRegisters gs_regs;
@@ -470,6 +474,7 @@ public:
 
     std::array<EeTimer, 4> m_eeTimers{};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    bool processToScratchpadChain(uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
     void queueCompletedIntcCause(uint32_t cause);

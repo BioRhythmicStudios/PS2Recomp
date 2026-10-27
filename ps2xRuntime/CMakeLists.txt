@@ -384,6 +384,8 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_async_queue.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/ipu/ps2_ipu.cpp
+    src/lib/ipu/ps2_ipu_mpeg.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp

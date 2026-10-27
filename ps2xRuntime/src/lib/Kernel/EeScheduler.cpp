@@ -424,7 +424,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // 0..127 as in the kernel: libkernel's init creates its request-servicing thread at
+    // priority 0 and then lowers the main thread to 1.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -702,7 +704,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1278,12 +1280,9 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
-    if (!dmac && !matching.empty())
-    {
-        // The kernel's INTC dispatcher acknowledges a cause it delivers. A cause nobody handles
-        // (VBON while libgraph's sceGsSyncV polls it) stays latched for the guest to see.
-        m_runtime.memory().acknowledgeIntcStatus(cause);
-    }
+    // The cause stays latched in INTC_STAT even when a handler takes it: libgraph's sceGsSyncV
+    // clears VBON and polls for it while Sony's movie player has its own VBON handler installed.
+    // Handlers run once per event here, so a latched cause does not re-trigger them.
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};

@@ -2392,7 +2392,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(0x1000F000u, 1u << 2), "INTC_STAT write should succeed");
             t.Equals(mem.readIORegister(0x1000F000u), 1u << 5, "writing 1 clears only that cause");
             mem.acknowledgeIntcStatus(5u);
-            t.Equals(mem.readIORegister(0x1000F000u), 0u, "the dispatcher acknowledgement clears a delivered cause");
+            t.Equals(mem.readIORegister(0x1000F000u), 0u, "acknowledgeIntcStatus clears a latched cause");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)

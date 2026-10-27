@@ -346,6 +346,38 @@ void register_code_generator_tests()
                  "stale MMIO address should not replace the address calculated by guest registers");
     });
 
+    tc.Run("sign branches test the whole 64-bit register", [](TestCase &t) {
+        // ld a0 then bgez a0 must see bit 63 (IPU_CMD.BUSY), not bit 31 of the low word.
+        Function func;
+        func.name = "sign_branches";
+        func.start = 0x3000;
+        func.end = 0x3020;
+        func.isRecompiled = true;
+
+        auto branch = [](uint32_t address, uint32_t opcode, uint8_t rs, uint8_t rt)
+        {
+            Instruction inst = makeIType(address, opcode, rs, rt, 2);
+            inst.isBranch = true;
+            inst.hasDelaySlot = true;
+            return inst;
+        };
+        std::vector<Instruction> instructions;
+        instructions.push_back(branch(0x3000, OPCODE_REGIMM, 4, REGIMM_BGEZ));
+        instructions.push_back(makeNop(0x3004));
+        instructions.push_back(branch(0x3008, OPCODE_BLEZ, 5, 0));
+        instructions.push_back(makeNop(0x300C));
+        instructions.push_back(makeNop(0x3010));
+        instructions.push_back(makeNop(0x3014));
+
+        CodeGenerator gen({}, {});
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("sign branches test the whole 64-bit register", generated);
+
+        t.IsTrue(generated.find("GPR_S64(ctx, 4) >= 0") != std::string::npos, "BGEZ should compare the 64-bit register");
+        t.IsTrue(generated.find("GPR_S64(ctx, 5) <= 0") != std::string::npos, "BLEZ should compare the 64-bit register");
+        t.IsTrue(generated.find("GPR_S32(ctx, 4) >= 0") == std::string::npos, "BGEZ should not truncate to 32 bits");
+    });
+
     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {
         Function func;
         func.name = "rdram_access";
