@@ -997,6 +997,32 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF arbiter preserves path identity for device sinks", [](TestCase &t)
+        {
+            GifArbiter arbiter;
+            std::vector<GifPathId> paths;
+            std::vector<uint8_t> firstBytes;
+            arbiter.setPathPacketFn([&](GifPathId path, const uint8_t *data, uint32_t size)
+            {
+                paths.push_back(path);
+                firstBytes.push_back(size ? data[0] : 0u);
+            });
+            const std::vector<uint8_t> p1(16u, 0x11u);
+            const std::vector<uint8_t> p2(16u, 0x22u);
+            const std::vector<uint8_t> p3(16u, 0x33u);
+            arbiter.submit(GifPathId::Path3, p3.data(), static_cast<uint32_t>(p3.size()));
+            arbiter.submit(GifPathId::Path2, p2.data(), static_cast<uint32_t>(p2.size()));
+            arbiter.submit(GifPathId::Path1, p1.data(), static_cast<uint32_t>(p1.size()));
+            arbiter.drain();
+            t.Equals(paths.size(), static_cast<size_t>(3u), "all device packets should be drained");
+            t.Equals(paths[0], GifPathId::Path1, "first path should be PATH1");
+            t.Equals(paths[1], GifPathId::Path2, "second path should be PATH2");
+            t.Equals(paths[2], GifPathId::Path3, "third path should be PATH3");
+            t.Equals(firstBytes[0], static_cast<uint8_t>(0x11u), "PATH1 payload should be unchanged");
+            t.Equals(firstBytes[1], static_cast<uint8_t>(0x22u), "PATH2 payload should be unchanged");
+            t.Equals(firstBytes[2], static_cast<uint8_t>(0x33u), "PATH3 payload should be unchanged");
+        });
+
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
         {
             PS2Memory mem;

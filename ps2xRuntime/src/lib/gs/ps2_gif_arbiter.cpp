@@ -21,7 +21,7 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
-    if (!data || sizeBytes < 16 || !m_processFn)
+    if (!data || sizeBytes < 16 || (!m_processFn && !m_pathFn))
         return;
 
     GifArbiterPacket pkt;
@@ -35,7 +35,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
 
 void GifArbiter::drain()
 {
-    if (!m_processFn)
+    if (!m_processFn && !m_pathFn)
         return;
 
     std::stable_sort(m_queue.begin(), m_queue.end(),
@@ -57,7 +57,9 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
-            if (m_takeFn)
+            if (m_pathFn)
+                m_pathFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            else if (m_takeFn)
                 m_takeFn(std::move(pkt.data));
             else
                 m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));

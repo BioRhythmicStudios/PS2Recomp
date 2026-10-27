@@ -33,6 +33,10 @@ public:
     // packets for a GS worker without copying them again). Arbitration order is unchanged.
     using TakePacketFn = std::function<void(std::vector<uint8_t> &&)>;
     void setTakePacketFn(TakePacketFn fn) { m_takeFn = std::move(fn); }
+    // Optional device sink for renderers which retain independent GIF state per path.
+    // Receives the same arbitration order as the CPU sink and preserves packet boundaries.
+    using PathPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+    void setPathPacketFn(PathPacketFn fn) { m_pathFn = std::move(fn); }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -42,6 +46,7 @@ public:
 private:
     ProcessPacketFn m_processFn;
     TakePacketFn m_takeFn;
+    PathPacketFn m_pathFn;
     std::vector<GifArbiterPacket> m_queue;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
