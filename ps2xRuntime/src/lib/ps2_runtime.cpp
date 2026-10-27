@@ -391,6 +391,28 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
+    if (const auto &source = rt->hostFrameSource())
+    {
+        uint32_t width = 0u, height = 0u;
+        if (source(s_scratch, width, height) && width != 0u && height != 0u &&
+            s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+        {
+            std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+            const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
+            const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+            for (uint32_t y = 0; y < copyHeight; ++y)
+                std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(y) * FB_WIDTH * 4u,
+                            s_scratch.data() + static_cast<size_t>(y) * width * 4u, static_cast<size_t>(copyWidth) * 4u);
+            UpdateTexture(tex, s_uploadBuffer.data());
+            s_lastWidth = width;
+            s_lastHeight = height;
+            s_hasUploadedFrame = true;
+        }
+        outWidth = s_hasUploadedFrame ? s_lastWidth : FB_WIDTH;
+        outHeight = s_hasUploadedFrame ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        return;
+    }
+
     // With a GS worker (PS2X_GS_THREAD=1) the worker latches each flip at its place in the stream; the presenter
     // only picks up a newly latched frame. Inline, the presenter latches once per VBlank as before.
     const bool asyncGs = rt->gs().asyncEnabled();

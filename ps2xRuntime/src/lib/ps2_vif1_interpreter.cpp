@@ -347,7 +347,8 @@ uint32_t PS2Memory::submitPendingPath2Image(const uint8_t *data, uint32_t availa
         (static_cast<uint64_t>(kGifFmtImage) << 58);
     std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
     std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
-    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl,
+                    true);
 
     m_vif1PendingPath2ImageQwc -= chunkQw;
     if (m_vif1PendingPath2ImageQwc == 0u)

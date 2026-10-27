@@ -521,6 +521,26 @@ void register_ps2_gs_tests()
                      "GsSetCrt should return success");
         });
 
+        tc.Run("GsSetCrt programs the SMODE1 CRTC mode for PAL and NTSC", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, 1u); // interlaced
+            setRegU32(ctx, 5, 3u); // PAL
+            setRegU32(ctx, 6, 1u); // frame mode
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            const uint64_t pal = runtime.memory().gs().smode1;
+            t.Equals((pal >> 13) & 0x3ull, 3ull, "PAL should select CMOD 3");
+            t.Equals((pal >> 3) & 0x7Full, 32ull, "PAL should select the analogue LC");
+
+            setRegU32(ctx, 5, 2u); // NTSC
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.Equals((runtime.memory().gs().smode1 >> 13) & 0x3ull, 2ull, "NTSC should select CMOD 2");
+        });
+
         tc.Run("sceGsSetDefDBuffDc seeds display envs and swap applies the selected page", [](TestCase &t)
         {
             PS2Runtime runtime;

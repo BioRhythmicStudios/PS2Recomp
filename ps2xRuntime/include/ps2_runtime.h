@@ -466,6 +466,13 @@ public:
     inline const GS &gs() const { return m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
+
+    // Optional replacement for the CPU GS as the source of window frames (e.g. a GPU GS device). Called by the
+    // presenter on the main thread; returns true and fills RGBA pixels when a frame newer than the last call is
+    // ready, false to keep showing the previous one. Unset (the default), the CPU GS presentation is used.
+    using HostFrameSource = std::function<bool(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)>;
+    void setHostFrameSource(HostFrameSource source) { m_hostFrameSource = std::move(source); }
+    const HostFrameSource &hostFrameSource() const { return m_hostFrameSource; }
     inline VU1Interpreter &vu0() { return m_vu0; }
     inline const VU1Interpreter &vu0() const { return m_vu0; }
     inline VU1Interpreter &vu1() { return m_vu1; }
@@ -515,6 +522,7 @@ private:
 private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
+    HostFrameSource m_hostFrameSource;
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;

@@ -858,6 +858,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return false;
 
     ++m_nativePackedGIFPacketCount;
+    m_streamStats.nativePackedPackets.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -870,6 +871,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
 {
     syncWithQueuedWork("native image upload");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_streamStats.nativeImageUploads.fetch_add(1, std::memory_order_relaxed);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 

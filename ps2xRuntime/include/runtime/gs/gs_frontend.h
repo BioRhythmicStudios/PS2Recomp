@@ -110,6 +110,8 @@ struct GSStreamStats
     std::atomic<uint64_t> trxdir[4]{};       // transfers started: 0 host->local, 1 local->host, 2 local->local, 3 off
     std::atomic<uint64_t> localToHostReads{0}; // consumeLocalToHostBytes calls
     std::atomic<uint64_t> presentationLatches{0};
+    std::atomic<uint64_t> nativePackedPackets{0}; // processNativePackedGIFPacket shortcuts (bypass processGIFPacket)
+    std::atomic<uint64_t> nativeImageUploads{0};  // uploadImageNative shortcuts (bypass processGIFPacket)
 };
 
 // The privileged display registers that presentation reads, as one snapshot. With an asynchronous GS the worker

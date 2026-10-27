@@ -1002,7 +1002,7 @@ void register_ps2_memory_tests()
             GifArbiter arbiter;
             std::vector<GifPathId> paths;
             std::vector<uint8_t> firstBytes;
-            arbiter.setPathPacketFn([&](GifPathId path, const uint8_t *data, uint32_t size)
+            arbiter.setPathPacketFn([&](GifPathId path, const uint8_t *data, uint32_t size, bool)
             {
                 paths.push_back(path);
                 firstBytes.push_back(size ? data[0] : 0u);
@@ -2341,6 +2341,44 @@ void register_ps2_memory_tests()
             for (const auto &p : captured)
                 imageBytes += p.size();
             t.Equals(imageBytes, static_cast<size_t>(16u + 16u + 32u), "the setup tag plus the wrapped image should reach the GIF");
+        });
+
+        tc.Run("VIF1 image continuation marks its added GIFtag for device sinks", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            GifArbiter arbiter;
+            struct Seen
+            {
+                std::vector<uint8_t> bytes;
+                bool synthetic;
+            };
+            std::vector<Seen> seen;
+            arbiter.setPathPacketFn([&](GifPathId path, const uint8_t *data, uint32_t size, bool synthetic)
+            {
+                t.Equals(path, GifPathId::Path2, "VIF DIRECT packets are PATH2");
+                seen.push_back({std::vector<uint8_t>(data, data + size), synthetic});
+            });
+            mem.setGifArbiter(&arbiter);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
+            appendU64(packet, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x00u, 0u, 0u)); // NOP
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u)); // DIRECT 2
+            for (uint32_t i = 0; i < 32u; ++i)
+                packet.push_back(static_cast<uint8_t>(0x80u | i));
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            mem.setGifArbiter(nullptr);
+
+            t.Equals(seen.size(), static_cast<size_t>(2u), "the setup tag and the continuation should be separate packets");
+            t.IsFalse(seen[0].synthetic, "the game's own IMAGE tag is not synthetic");
+            t.Equals(seen[0].bytes.size(), static_cast<size_t>(16u), "the first DIRECT carries only the game's tag");
+            t.IsTrue(seen[1].synthetic, "the continuation's leading tag was added by the host");
+            t.Equals(seen[1].bytes.size(), static_cast<size_t>(16u + 32u), "the CPU sink still receives the added tag");
+            t.Equals(seen[1].bytes[16], static_cast<uint8_t>(0x80u), "the texels follow the added tag unchanged");
+            t.Equals(seen[1].bytes[47], static_cast<uint8_t>(0x80u | 31u), "all texels are present");
         });
 
         tc.Run("INTC_STAT latches causes and clears them with write-one", [](TestCase &t)

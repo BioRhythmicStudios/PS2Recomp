@@ -17,6 +17,7 @@ struct GifArbiterPacket
     GifPathId pathId;
     bool path2DirectHl = false;
     bool path3Image = false;
+    bool syntheticImageTag = false;
     std::vector<uint8_t> data;
 };
 
@@ -35,10 +36,13 @@ public:
     void setTakePacketFn(TakePacketFn fn) { m_takeFn = std::move(fn); }
     // Optional device sink for renderers which retain independent GIF state per path.
     // Receives the same arbitration order as the CPU sink and preserves packet boundaries.
-    using PathPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+    // syntheticImageTag: the first qword is an IMAGE GIFtag the host added so that a continuation of an earlier
+    // IMAGE transfer parses on its own (the CPU GS needs it). A GS which keeps GIF state across packets must skip it.
+    using PathPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t, bool syntheticImageTag)>;
     void setPathPacketFn(PathPacketFn fn) { m_pathFn = std::move(fn); }
 
-    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false,
+                bool syntheticImageTag = false);
 
     void drain();
     bool empty() const { return m_queue.empty(); }

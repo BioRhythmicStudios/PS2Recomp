@@ -19,7 +19,8 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     return flg == 2u || flg == 3u;
 }
 
-void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl,
+                        bool syntheticImageTag)
 {
     if (!data || sizeBytes < 16 || (!m_processFn && !m_pathFn))
         return;
@@ -28,6 +29,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+    pkt.syntheticImageTag = syntheticImageTag;
     pkt.data.resize(sizeBytes);
     std::memcpy(pkt.data.data(), data, sizeBytes);
     m_queue.push_back(std::move(pkt));
@@ -58,7 +60,7 @@ void GifArbiter::drain()
         if (!pkt.data.empty())
         {
             if (m_pathFn)
-                m_pathFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+                m_pathFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()), pkt.syntheticImageTag);
             else if (m_takeFn)
                 m_takeFn(std::move(pkt.data));
             else

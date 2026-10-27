@@ -2020,7 +2020,8 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
-void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
+void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl,
+                                bool syntheticImageTag)
 {
     if (!data || sizeBytes < 16)
         return;
@@ -2036,7 +2037,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     }
 
     if (m_gifArbiter)
-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, syntheticImageTag);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
 
