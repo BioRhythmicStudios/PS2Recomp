@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <vector>
@@ -263,6 +264,70 @@ struct JumpTable
 
 class Ps2Ipu;
 
+// EE hardware register file. Behaves like std::unordered_map<uint32_t, uint32_t> for the operations the runtime uses
+// (operator[], find, count, end, clear) - a register "exists" once written or referenced through operator[] - but
+// word-aligned registers in 0x10000000-0x1000FFFF live in a flat table, since the EE polls them constantly.
+class IoRegisterFile
+{
+public:
+    struct Entry
+    {
+        uint32_t first = 0;
+        uint32_t second = 0;
+    };
+
+    IoRegisterFile() : m_table(kTableSize), m_present(kTableSize, 0u) {}
+
+    uint32_t &operator[](uint32_t address)
+    {
+        if (Entry *entry = tableEntry(address))
+        {
+            const size_t index = static_cast<size_t>(entry - m_table.data());
+            if (!m_present[index])
+            {
+                m_present[index] = 1u;
+                entry->first = address;
+                entry->second = 0u;
+            }
+            return entry->second;
+        }
+        Entry &entry = m_other[address];
+        entry.first = address;
+        return entry.second;
+    }
+    Entry *find(uint32_t address)
+    {
+        if (Entry *entry = tableEntry(address))
+            return m_present[static_cast<size_t>(entry - m_table.data())] ? entry : nullptr;
+        const auto it = m_other.find(address);
+        return it == m_other.end() ? nullptr : &it->second;
+    }
+    const Entry *find(uint32_t address) const { return const_cast<IoRegisterFile *>(this)->find(address); }
+    size_t count(uint32_t address) const { return find(address) != nullptr ? 1u : 0u; }
+    Entry *end() { return nullptr; }
+    const Entry *end() const { return nullptr; }
+    void clear()
+    {
+        std::fill(m_table.begin(), m_table.end(), Entry{});
+        std::fill(m_present.begin(), m_present.end(), uint8_t{0});
+        m_other.clear();
+    }
+
+private:
+    static constexpr uint32_t kBase = 0x10000000u;
+    static constexpr size_t kTableSize = 0x10000u / 4u;
+    Entry *tableEntry(uint32_t address)
+    {
+        const uint32_t offset = address - kBase;
+        if (offset >= 0x10000u || (offset & 3u) != 0u)
+            return nullptr;
+        return &m_table[offset >> 2];
+    }
+    std::vector<Entry> m_table;
+    std::vector<uint8_t> m_present;
+    std::unordered_map<uint32_t, Entry> m_other;
+};
+
 class PS2Memory
 {
 public:
@@ -395,7 +460,7 @@ public:
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
-    std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    IoRegisterFile m_ioRegisters;
     std::unique_ptr<Ps2Ipu> m_ipu; // IPU registers, FIFOs and DMA channels 3/4
 
     // Registers

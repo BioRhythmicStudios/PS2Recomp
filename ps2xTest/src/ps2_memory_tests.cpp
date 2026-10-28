@@ -2423,5 +2423,25 @@ void register_ps2_memory_tests()
             t.IsTrue(threwRead32, "unaligned read32 should throw");
             t.IsTrue(threwWrite64, "unaligned write64 should throw");
         });
+
+        tc.Run("IoRegisterFile behaves like a map in and outside its flat range", [](TestCase &t)
+        {
+            IoRegisterFile regs;
+            for (const uint32_t address : {0x1000F000u, 0x1000FFFCu, 0x10000000u, 0x1000F002u, 0x12001000u})
+            {
+                t.IsTrue(regs.count(address) == 0u, "a register starts absent");
+                t.IsTrue(regs.find(address) == regs.end(), "find of an absent register returns end()");
+                t.Equals(regs[address], 0u, "operator[] creates a zero register");
+                t.IsTrue(regs.count(address) == 1u, "operator[] makes the register present");
+                regs[address] = address ^ 0x5A5Au;
+                const auto it = regs.find(address);
+                t.IsTrue(it != regs.end(), "find of a present register succeeds");
+                t.Equals(it->second, address ^ 0x5A5Au, "find returns the stored value");
+            }
+            t.IsTrue(regs.count(0x1000F004u) == 0u, "neighbouring registers stay absent");
+            regs.clear();
+            t.IsTrue(regs.count(0x1000F000u) == 0u && regs.count(0x12001000u) == 0u, "clear removes every register");
+            t.Equals(regs[0x1000F000u], 0u, "a cleared register is recreated as zero");
+        });
     });
 }
