@@ -130,6 +130,14 @@ namespace ps2x::iop
             return false;
         }
 
+        // Mixed SPU2 output: `frames` interleaved signed 16-bit L/R samples at 48 kHz, in guest time order. The
+        // default discards it, for hosts without audio output.
+        virtual void audioOutput(const int16_t *samples, size_t frames)
+        {
+            (void)samples;
+            (void)frames;
+        }
+
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
 }

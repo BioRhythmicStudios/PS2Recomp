@@ -599,7 +599,11 @@ namespace ps2x::iop::detail
             if (resultAddress == 0u || nameAddress == 0u)
                 return false;
 
-            const std::string guestPath = memory.readString(nameAddress, 1024u);
+            // sceCdSearchFile takes a path on the disc ("\DIR\FILE.EXT;1") with no device; a "cdrom0:" prefix is
+            // accepted as well.
+            std::string guestPath = memory.readString(nameAddress, 1024u);
+            if (guestPath.find(':') == std::string::npos)
+                guestPath.insert(0, "cdrom0:");
             IsoNode *node = findVirtualIsoNode(guestPath);
             if (!node)
                 return false;

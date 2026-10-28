@@ -5,6 +5,7 @@
 #include "imports/iop_imports.h"
 #include "imports/iop_intrman.h"
 #include "imports/iop_ioman.h"
+#include "imports/iop_libsd.h"
 #include "core/iop_kernel.h"
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
@@ -15,10 +16,13 @@
 #include "imports/iop_sysmem.h"
 #include "imports/iop_timrman.h"
 #include "imports/iop_vblank.h"
+#include "spu2/iop_spu2.h"
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -37,6 +41,10 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        // The SPU2 is brought up to the current IOP cycle at every libsd call and at least every 64 samples
+        // (1.3 ms of guest time); its output reaches the host in blocks of 256 frames or more.
+        constexpr uint64_t kSpu2SyncCycles = 64u * IopSpu2::IopCyclesPerSample;
+        constexpr size_t kSpu2OutputFrames = 256u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -106,6 +114,7 @@ namespace ps2x::iop::detail
               intrman(memory),
               timrman(),
               ioman(memory),
+              libsd(host, memory, spu2),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
@@ -124,6 +133,11 @@ namespace ps2x::iop::detail
             intrman.reset();
             timrman.reset();
             ioman.reset();
+            spu2.reset();
+            libsd.reset();
+            spu2Epoch = 0;
+            spu2LastSync = 0;
+            audioOut.clear();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -341,6 +355,37 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
+            if (iequals(call.library, "libsd"))
+            {
+                syncSpu2();
+                std::optional<IopLibsd::Callback> callback;
+                const std::array<uint32_t, 4> arguments{cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
+                (void)libsd.dispatchImport(call.ordinal, cpu, totalCycles, callback);
+                // PS2X_LIBSD_TRACE=<n>: log the first n calls of each libsd function.
+                static const uint64_t traceLimit = []
+                {
+                    const char *value = std::getenv("PS2X_LIBSD_TRACE");
+                    return value ? std::strtoull(value, nullptr, 0) : 0ull;
+                }();
+                if (traceLimit != 0u && libsd.calls(call.ordinal) <= traceLimit)
+                {
+                    std::ostringstream out;
+                    out << "[IOP:libsd] #" << std::dec << call.ordinal << '(' << std::hex << "0x" << arguments[0]
+                        << ", 0x" << arguments[1] << ", 0x" << arguments[2] << ", 0x" << arguments[3] << ") -> 0x"
+                        << cpu.gpr[2] << " ra=0x" << cpu.gpr[31] << " sample=" << std::dec << spu2.samplesMixed();
+                    log(LogLevel::Debug, out.str());
+                }
+                if (call.ordinal == 4u)
+                {
+                    // sceSdInit restarts the sample clock with the SPU2 it has reset.
+                    spu2Epoch = totalCycles - spu2.samplesMixed() * IopSpu2::IopCyclesPerSample;
+                    spu2LastSync = totalCycles;
+                }
+                if (callback)
+                    pendingGuestCallbacks.emplace(callback->cycle,
+                                                  ScheduledGuestCallback{callback->function, callback->gp, callback->argument});
+                return ImportDisposition::Handled;
+            }
 
             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
             if (target != 0u)
@@ -512,6 +557,25 @@ namespace ps2x::iop::detail
             servicingDmaInterrupts = false;
         }
 
+        // Brings the SPU2 up to the current IOP cycle and hands full output blocks to the host.
+        void syncSpu2()
+        {
+            if (!libsd.initialized())
+                return;
+            spu2LastSync = totalCycles;
+            const uint64_t target = (totalCycles - spu2Epoch) / IopSpu2::IopCyclesPerSample;
+            while (spu2.samplesMixed() < target)
+            {
+                const uint64_t frames = std::min<uint64_t>(target - spu2.samplesMixed(), 4096u);
+                spu2.run(static_cast<uint32_t>(frames), audioOut);
+                if (audioOut.size() >= kSpu2OutputFrames * 2u)
+                {
+                    host.audioOutput(audioOut.data(), audioOut.size() / 2u);
+                    audioOut.clear();
+                }
+            }
+        }
+
         void servicePendingGuestCallbacks()
         {
             if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
@@ -622,19 +686,44 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // A module starts as start(argc, argv): argv[0] is the module path, then each NUL-terminated string of
+            // the argument block, then a null pointer.
+            std::vector<std::string> argv{module.path};
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const char *text = static_cast<const char *>(arguments);
+                size_t begin = 0u;
+                for (size_t i = 0; i <= argumentSize; ++i)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    if (i == argumentSize ? i > begin : text[i] == '\0')
+                    {
+                        argv.emplace_back(text + begin, i - begin);
+                        begin = i + 1u;
+                    }
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
-            if (args)
-                freeAllocation(args);
+            uint32_t stringBytes = 0u;
+            for (const std::string &arg : argv)
+                stringBytes += static_cast<uint32_t>(arg.size()) + 1u;
+            const uint32_t pointerOffset = (stringBytes + 3u) & ~3u;
+            const uint32_t block = allocate(pointerOffset + 4u * static_cast<uint32_t>(argv.size() + 1u), 16u);
+            uint32_t argvAddress = 0u;
+            if (block)
+            {
+                argvAddress = block + pointerOffset;
+                uint32_t cursor = block;
+                for (size_t i = 0; i < argv.size(); ++i)
+                {
+                    writeRam(cursor, argv[i].c_str(), argv[i].size() + 1u);
+                    write32(argvAddress + 4u * static_cast<uint32_t>(i), cursor);
+                    cursor += static_cast<uint32_t>(argv[i].size()) + 1u;
+                }
+                write32(argvAddress + 4u * static_cast<uint32_t>(argv.size()), 0u);
+            }
+            const uint32_t startResult = callFunction(module.entry, block ? static_cast<uint32_t>(argv.size()) : 0u,
+                                                      argvAddress, 0u, 0u, module.gp);
+            if (block)
+                freeAllocation(block);
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
@@ -699,6 +788,11 @@ namespace ps2x::iop::detail
         IopIntrman intrman;
         IopTimrman timrman;
         IopIoman ioman;
+        IopSpu2 spu2;
+        IopLibsd libsd;
+        uint64_t spu2Epoch = 0;    // IOP cycle of SPU2 sample 0
+        uint64_t spu2LastSync = 0; // IOP cycle of the last SPU2 sync
+        std::vector<int16_t> audioOut;
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
@@ -761,6 +855,17 @@ namespace ps2x::iop::detail
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
+        if (m_impl->libsd.initialized() && m_impl->totalCycles - m_impl->spu2LastSync >= kSpu2SyncCycles)
+        {
+            try
+            {
+                m_impl->syncSpu2();
+            }
+            catch (...)
+            {
+                // Runtime scheduling must never throw through EeScheduler::accountCycles().
+            }
+        }
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

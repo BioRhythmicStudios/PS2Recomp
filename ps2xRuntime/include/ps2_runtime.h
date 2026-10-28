@@ -315,6 +315,8 @@ public:
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
+    [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
     bool freeIopMemory(uint32_t address);
     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
@@ -473,6 +475,18 @@ public:
     using HostFrameSource = std::function<bool(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)>;
     void setHostFrameSource(HostFrameSource source) { m_hostFrameSource = std::move(source); }
     const HostFrameSource &hostFrameSource() const { return m_hostFrameSource; }
+
+    // Optional consumer of the emulated IOP's mixed SPU2 output: interleaved signed 16-bit L/R at 48 kHz, in guest
+    // time order, called from the thread that runs the EE. Unset (the default), the output is discarded.
+    using IopAudioSink = std::function<void(const int16_t *samples, size_t frames)>;
+    void setIopAudioSink(IopAudioSink sink) { m_iopAudioSink = std::move(sink); }
+    const IopAudioSink &iopAudioSink() const { return m_iopAudioSink; }
+    // Plays the emulated IOP's SPU2 output on the host audio device (windowed runs: the device opens with the
+    // window). The output is buffered about 50 ms behind the guest.
+    void setIopAudioPlayback(bool enabled) { m_iopAudioPlayback = enabled; }
+    void playIopAudio(const int16_t *samples, size_t frames);
+    [[nodiscard]] uint64_t iopAudioUnderruns() const;
+    [[nodiscard]] uint64_t iopAudioDroppedFrames() const;
     inline VU1Interpreter &vu0() { return m_vu0; }
     inline const VU1Interpreter &vu0() const { return m_vu0; }
     inline VU1Interpreter &vu1() { return m_vu1; }
@@ -510,8 +524,6 @@ private:
     void runHeadless();
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
-    [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
-    [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
@@ -523,6 +535,8 @@ private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     HostFrameSource m_hostFrameSource;
+    IopAudioSink m_iopAudioSink;
+    bool m_iopAudioPlayback = false;
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;

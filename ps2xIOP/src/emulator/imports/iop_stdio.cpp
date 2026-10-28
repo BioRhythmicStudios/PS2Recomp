@@ -4,10 +4,82 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        // Expands a printf format with the IOP o32 arguments: `firstArgument` counts from a0; arguments past a3 are
+        // on the caller's stack at sp+16.
+        std::string formatGuest(const IopMemory &memory, const IopCpuState &cpu, const std::string &format,
+                                uint32_t firstArgument)
+        {
+            uint32_t next = firstArgument;
+            const auto argument = [&]() -> uint32_t
+            {
+                const uint32_t index = next++;
+                return index < 4u ? cpu.gpr[4u + index] : memory.read32(cpu.gpr[29] + 16u + (index - 4u) * 4u);
+            };
+            std::string out;
+            for (size_t i = 0; i < format.size(); ++i)
+            {
+                if (format[i] != '%')
+                {
+                    out += format[i];
+                    continue;
+                }
+                std::string spec = "%";
+                ++i;
+                while (i < format.size() && std::strchr("-+ #0123456789.", format[i]))
+                    spec += format[i++];
+                while (i < format.size() && (format[i] == 'l' || format[i] == 'h'))
+                    ++i;
+                if (i >= format.size())
+                    break;
+                const char conversion = format[i];
+                char buffer[256];
+                switch (conversion)
+                {
+                case '%':
+                    out += '%';
+                    continue;
+                case 's':
+                {
+                    const std::string text = memory.readString(argument(), 512u);
+                    std::snprintf(buffer, sizeof(buffer), (spec + 's').c_str(), text.c_str());
+                    break;
+                }
+                case 'c':
+                    std::snprintf(buffer, sizeof(buffer), (spec + 'c').c_str(), static_cast<int>(argument() & 0xFFu));
+                    break;
+                case 'd':
+                case 'i':
+                    std::snprintf(buffer, sizeof(buffer), (spec + 'd').c_str(), static_cast<int32_t>(argument()));
+                    break;
+                case 'u':
+                case 'x':
+                case 'X':
+                case 'o':
+                    std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), argument());
+                    break;
+                case 'p':
+                    std::snprintf(buffer, sizeof(buffer), "0x%08x", argument());
+                    break;
+                default:
+                    buffer[0] = '%';
+                    buffer[1] = conversion;
+                    buffer[2] = '\0';
+                    break;
+                }
+                out += buffer;
+            }
+            return out;
+        }
+    }
+
     IopStdio::IopStdio(IopHost &host, IopMemory &memory) noexcept
         : m_host(host), m_memory(memory)
     {
@@ -31,8 +103,12 @@ namespace ps2x::iop::detail
         switch (ordinal)
         {
         case 4: // printf
-            logString("[IOP printf] ", a0);
+        {
+            const std::string text = formatGuest(m_memory, cpu, m_memory.readString(a0, 2048u), 1u);
+            m_host.log(LogLevel::Info, "[IOP printf] " + text);
+            setV0(static_cast<uint32_t>(text.size()));
             return true;
+        }
         case 5: // getchar
         case 10:
             setV0(0xFFFFFFFFu);

@@ -508,6 +508,111 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 }
 
+namespace
+{
+    // Host playback of the IOP's SPU2 output: the EE thread writes guest-timed samples into a ring, and the
+    // audio device's callback reads them. Playback starts once 50 ms are buffered; a dry ring plays silence
+    // (an underrun) and waits for 50 ms again; more than 250 ms buffered (the guest running ahead of real time)
+    // drops the oldest samples back to 50 ms.
+    struct IopAudioPlayer
+    {
+        static constexpr size_t kCapacityFrames = 48000u;
+        static constexpr size_t kStartFrames = 2400u;
+        static constexpr size_t kMaxFrames = 12000u;
+        std::mutex mutex;
+        std::vector<int16_t> ring = std::vector<int16_t>(kCapacityFrames * 2u);
+        size_t readFrame = 0;
+        size_t buffered = 0;
+        bool playing = false;
+        bool started = false;
+        uint64_t underruns = 0;
+        uint64_t dropped = 0;
+        AudioStream stream{};
+    };
+
+    IopAudioPlayer &iopAudioPlayer()
+    {
+        static IopAudioPlayer player;
+        return player;
+    }
+
+    void iopAudioCallback(void *buffer, unsigned int frames)
+    {
+        IopAudioPlayer &p = iopAudioPlayer();
+        int16_t *out = static_cast<int16_t *>(buffer);
+        std::lock_guard<std::mutex> lock(p.mutex);
+        if (!p.playing && p.buffered >= IopAudioPlayer::kStartFrames)
+            p.playing = true;
+        for (unsigned int i = 0; i < frames; ++i)
+        {
+            if (!p.playing || p.buffered == 0u)
+            {
+                if (p.playing)
+                {
+                    ++p.underruns;
+                    p.playing = false;
+                }
+                out[2u * i] = out[2u * i + 1u] = 0;
+                continue;
+            }
+            out[2u * i] = p.ring[2u * p.readFrame];
+            out[2u * i + 1u] = p.ring[2u * p.readFrame + 1u];
+            p.readFrame = (p.readFrame + 1u) % IopAudioPlayer::kCapacityFrames;
+            --p.buffered;
+        }
+    }
+}
+
+void PS2Runtime::playIopAudio(const int16_t *samples, size_t frames)
+{
+    if (!m_iopAudioPlayback || !IsAudioDeviceReady())
+        return;
+    IopAudioPlayer &p = iopAudioPlayer();
+    if (!p.started)
+    {
+        p.started = true;
+        SetAudioStreamBufferSizeDefault(1024);
+        p.stream = LoadAudioStream(48000u, 16u, 2u);
+        SetAudioStreamCallback(p.stream, iopAudioCallback);
+        PlayAudioStream(p.stream);
+    }
+    std::lock_guard<std::mutex> lock(p.mutex);
+    for (size_t i = 0; i < frames; ++i)
+    {
+        if (p.buffered == IopAudioPlayer::kCapacityFrames)
+        {
+            p.readFrame = (p.readFrame + 1u) % IopAudioPlayer::kCapacityFrames;
+            --p.buffered;
+            ++p.dropped;
+        }
+        const size_t write = (p.readFrame + p.buffered) % IopAudioPlayer::kCapacityFrames;
+        p.ring[2u * write] = samples[2u * i];
+        p.ring[2u * write + 1u] = samples[2u * i + 1u];
+        ++p.buffered;
+    }
+    if (p.buffered > IopAudioPlayer::kMaxFrames)
+    {
+        const size_t drop = p.buffered - IopAudioPlayer::kStartFrames;
+        p.readFrame = (p.readFrame + drop) % IopAudioPlayer::kCapacityFrames;
+        p.buffered -= drop;
+        p.dropped += drop;
+    }
+}
+
+uint64_t PS2Runtime::iopAudioUnderruns() const
+{
+    IopAudioPlayer &p = iopAudioPlayer();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    return p.underruns;
+}
+
+uint64_t PS2Runtime::iopAudioDroppedFrames() const
+{
+    IopAudioPlayer &p = iopAudioPlayer();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    return p.dropped;
+}
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
