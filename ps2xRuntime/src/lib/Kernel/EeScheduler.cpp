@@ -371,6 +371,18 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
+uint32_t EeScheduler::idleCycleBudget(uint32_t limit) const noexcept
+{
+    uint64_t budget = limit;
+    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    if (nextEventCycle != 0u)
+        budget = std::min<uint64_t>(budget, nextEventCycle > m_eeCycle ? nextEventCycle - m_eeCycle : 1u);
+    if (m_sliceEndCycle > m_eeCycle)
+        budget = std::min<uint64_t>(budget, m_sliceEndCycle - m_eeCycle);
+    budget = std::min<uint64_t>(budget, m_runtime.memory().cyclesUntilNextEeTimerInterrupt());
+    return static_cast<uint32_t>(std::max<uint64_t>(budget, 1u));
+}
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
@@ -1896,8 +1908,14 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                // Host pacing: the next field is due one period after this one, but never earlier than now. After
+                // a stretch of slow frames (loading, a heavy scene) the chain would otherwise lag behind wall time
+                // and let the game run faster than the field rate until it caught up. The pacing debt is therefore
+                // at most one field; the guest-cycle schedule is unchanged.
+                const auto nextHostDeadline = std::max(scheduled.hostDeadline + m_vblankPeriod,
+                                                       std::chrono::steady_clock::now());
                 scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
-                              scheduled.hostDeadline + m_vblankPeriod,
+                              nextHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

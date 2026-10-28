@@ -339,6 +339,10 @@ public:
     [[nodiscard]] double vblankHz() const noexcept;
     // Guest EE cycles accounted so far (the clock that VBlank and timer events are scheduled on).
     [[nodiscard]] uint64_t currentCycle() const noexcept { return m_eeCycle; }
+    // EE cycles a pure polling loop may account in one checkpoint without passing the next scheduled event, EE
+    // timer interrupt or time-slice end (1..limit). Events posted from other threads are still seen at the next
+    // checkpoint, so limit bounds how late they can be observed.
+    [[nodiscard]] uint32_t idleCycleBudget(uint32_t limit) const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
