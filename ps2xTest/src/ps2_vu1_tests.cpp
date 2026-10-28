@@ -4,11 +4,16 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_aot.h"
 
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace
@@ -211,12 +216,122 @@ namespace
     {
         std::memcpy(values, data + qwordIndex * 16u, sizeof(float) * 4u);
     }
+
+    // Compiled-VU1 FMAC (vu1aot::fmac) against the interpreter: one upper instruction with the E bit, run to the end
+    // of the program, then the committed destination, MAC and status compared with the compiled result.
+    constexpr uint32_t aotUpper(uint8_t op, uint8_t dest, uint8_t ft, uint8_t fs, uint8_t fd)
+    {
+        return (static_cast<uint32_t>(dest & 0xFu) << 21) | (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
+               (static_cast<uint32_t>(fs & 0x1Fu) << 11) | (static_cast<uint32_t>(fd & 0x1Fu) << 6) |
+               static_cast<uint32_t>(op & 0x3Fu);
+    }
+    constexpr uint32_t aotUpperAcc(uint8_t specialOp, uint8_t dest, uint8_t ft, uint8_t fs)
+    {
+        return (static_cast<uint32_t>(dest & 0xFu) << 21) | (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
+               (static_cast<uint32_t>(fs & 0x1Fu) << 11) | (static_cast<uint32_t>(specialOp & 0x7Cu) << 4) |
+               static_cast<uint32_t>(specialOp & 0x3u) | 0x3Cu;
+    }
+
+    float aotOperand(uint32_t index)
+    {
+        static const uint32_t pool[] = {
+            0x3FC00000u, 0xC0100000u, 0x00000000u, 0x80000000u, 0x7F7FFFFFu, 0xFF7FFFFFu, 0x00800000u,
+            0x80800000u, 0x00012345u, 0x7F800000u, 0x7FC00000u, 0x5F000000u, 0x1F800000u, 0x9F800000u,
+            0x3F800001u, 0xBF800000u, 0x42F6E979u, 0xC2F6E979u, 0x7E000000u, 0x01000000u};
+        float value;
+        std::memcpy(&value, &pool[index % (sizeof(pool) / sizeof(pool[0]))], 4);
+        return value;
+    }
+
+    template <uint32_t I>
+    void checkAotFmac(TestCase &t, const char *name)
+    {
+        constexpr bool toAcc = (I & 0x3Cu) == 0x3Cu;
+        constexpr uint8_t dest = static_cast<uint8_t>((I >> 21) & 0xFu);
+        constexpr uint8_t fd = static_cast<uint8_t>((I >> 6) & 0x1Fu);
+        uint32_t seed = 0x12345u;
+        auto next = [&seed]()
+        {
+            seed = seed * 1103515245u + 12345u;
+            return seed >> 8;
+        };
+        uint32_t mismatches = 0;
+        for (uint32_t iteration = 0; iteration < 400u; ++iteration)
+        {
+            Vu1Fixture fx;
+            if (!fx.initialize())
+            {
+                t.IsTrue(false, "VU1 fixture should initialize");
+                return;
+            }
+            writeVuInstructionPair(fx.code, 0u, 0u, I | 0x40000000u);
+            writeVuInstructionPair(fx.code, 8u, 0u, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            VU1State &s = vu1.state();
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                s.vf[1][c] = aotOperand(next());
+                s.vf[2][c] = aotOperand(next());
+                s.vf[3][c] = aotOperand(next());
+                s.acc[c] = aotOperand(next());
+            }
+            s.q = aotOperand(next());
+            s.i = aotOperand(next());
+            const VU1State before = s;
+
+            float r[4];
+            VU1AotPending::Flag flag{};
+            const int previousRounding = std::fegetround();
+            std::fesetround(FE_TOWARDZERO);
+            vu1aot::fmac<I>(before, r, flag);
+            std::fesetround(previousRounding);
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
+
+            bool same = s.mac == flag.mac &&
+                        s.status == (flag.status | ((flag.status | flag.extraSticky) << 6));
+            const float *actual = toAcc ? s.acc : s.vf[fd];
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & (1u << (3u - c))) != 0u)
+                    same = same && std::memcmp(&actual[c], &r[c], 4) == 0;
+            if (!same && mismatches == 0u && std::getenv("PS2X_AOT_TEST_DETAIL"))
+            {
+                auto bits = [](float v) { uint32_t u; std::memcpy(&u, &v, 4); return u; };
+                std::fprintf(stderr, "%s: mac %04X/%04X status %03X/%03X+%X\n", name, s.mac, flag.mac, s.status, flag.status,
+                             flag.extraSticky);
+                for (uint32_t c = 0; c < 4u; ++c)
+                    std::fprintf(stderr, "  c%u vs=%08X vt=%08X acc=%08X q=%08X i=%08X -> interp %08X aot %08X\n", c,
+                                 bits(before.vf[1][c]), bits(before.vf[2][c]), bits(before.acc[c]), bits(before.q),
+                                 bits(before.i), bits(actual[c]), bits(r[c]));
+            }
+            mismatches += same ? 0u : 1u;
+        }
+        t.Equals(mismatches, 0u, std::string(name) + ": compiled FMAC result and flags should match the interpreter");
+    }
 }
 
 void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("compiled VU1 FMAC matches the interpreter on edge-case operands", [](TestCase &t)
+        {
+            checkAotFmac<aotUpper(0x28u, 0xFu, 2u, 1u, 3u)>(t, "ADD");
+            checkAotFmac<aotUpper(0x2Cu, 0x5u, 2u, 1u, 3u)>(t, "SUB.yw");
+            checkAotFmac<aotUpper(0x2Au, 0xFu, 2u, 1u, 3u)>(t, "MUL");
+            checkAotFmac<aotUpper(0x29u, 0xFu, 2u, 1u, 3u)>(t, "MADD");
+            checkAotFmac<aotUpper(0x2Du, 0xEu, 2u, 1u, 3u)>(t, "MSUB.xyz");
+            checkAotFmac<aotUpper(0x0Au, 0xFu, 2u, 1u, 3u)>(t, "MADDz");
+            checkAotFmac<aotUpper(0x0Du, 0xFu, 2u, 1u, 3u)>(t, "MSUBy");
+            checkAotFmac<aotUpper(0x21u, 0xFu, 2u, 1u, 3u)>(t, "MADDq");
+            checkAotFmac<aotUpper(0x1Eu, 0xFu, 2u, 1u, 3u)>(t, "MULi");
+            checkAotFmac<aotUpper(0x2Eu, 0xFu, 2u, 1u, 3u)>(t, "OPMSUB");
+            checkAotFmac<aotUpperAcc(0x29u, 0xBu, 2u, 1u)>(t, "MADDA.xzw");
+            checkAotFmac<aotUpperAcc(0x2Eu, 0xEu, 2u, 1u)>(t, "OPMULA");
+            checkAotFmac<aotUpperAcc(0x0Bu, 0xFu, 2u, 1u)>(t, "MADDAw");
+        });
+
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;

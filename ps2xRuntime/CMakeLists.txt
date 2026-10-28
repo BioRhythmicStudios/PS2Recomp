@@ -396,6 +396,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_aot.cpp
     src/lib/games_database.cpp
 )
 
@@ -611,3 +612,7 @@ endif()
 install(DIRECTORY include/
     DESTINATION include
 )
+
+# Generator for ahead-of-time compiled VU1 microprograms (runtime/ps2_vu1_aot.h).
+add_executable(ps2x_vu1aot tools/ps2x_vu1aot.cpp)
+target_link_libraries(ps2x_vu1aot PRIVATE ps2_runtime)

@@ -1,5 +1,6 @@
 #include <bit>
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_aot.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -197,6 +198,12 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
     applyDest(m_state.acc, result, dest);
 }
 
+// The FMAC flag calculations below take Z/S/U/O from the unrounded result (long double; a product of two floats
+// is exact in it). Under /fp:fast the compiler may evaluate those expressions in float, which turns an
+// underflowing product into zero, so they are compiled with precise floating point.
+#ifdef _MSC_VER
+#pragma float_control(precise, on, push)
+#endif
 void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                          uint8_t laneFlags[4])
 {
@@ -490,6 +497,9 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
     }
     return extraSticky;
 }
+#ifdef _MSC_VER
+#pragma float_control(pop)
+#endif
 
 void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
                                      uint32_t extraSticky)
@@ -919,10 +929,13 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        for (uint32_t i = 0; i < 16u; ++i)
+        const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+        if (source + 16u <= m_activeVuDataSize)
+            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, 16u);
+        else
         {
-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+            for (uint32_t i = 0; i < 16u; ++i)
+                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[(source + i) % m_activeVuDataSize];
         }
         m_xgkick.copiedBytes += 16u;
 
@@ -981,6 +994,18 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (m_packetCapture)
+    {
+        const uint32_t size = m_xgkick.totalBytes;
+        const uint8_t *sizeBytes = reinterpret_cast<const uint8_t *>(&size);
+        m_packetCapture->insert(m_packetCapture->end(), sizeBytes, sizeBytes + sizeof(size));
+        m_packetCapture->insert(m_packetCapture->end(), m_xgkick.packet.data(), m_xgkick.packet.data() + size);
+        if (!m_packetPassthrough)
+        {
+            m_xgkick.active = false;
+            return;
+        }
+    }
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -1682,6 +1707,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    if (!m_aotSuppressed && !m_aotVerifyCopy && verifyAot(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
+        return;
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
@@ -1691,7 +1718,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
-    while (m_cycle < budgetEnd && !m_stopRequested)
+    const uint64_t startCycle = m_cycle;
+    // A compiled microprogram either completes the call or hands over to this loop at the top of a pair.
+    const bool compiledDone = !m_aotSuppressed &&
+                              tryRunAot(vuCode, codeSize, dataSize, memory, budgetEnd) == VU1AotResult::Completed;
+    const uint64_t interpreterStartCycle = m_cycle;
+    while (!compiledDone && m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
@@ -1884,6 +1916,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (!m_aotSuppressed && !m_aotVerifyCopy)
+        countAotCycles(interpreterStartCycle - startCycle, m_cycle - interpreterStartCycle);
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

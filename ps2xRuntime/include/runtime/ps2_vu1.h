@@ -4,8 +4,13 @@
 #include <array>
 #include <cstdint>
 
+#include <vector>
+
 class GS;
 class PS2Memory;
+struct VU1AotImage;
+struct VU1AotRuntime;
+enum class VU1AotResult : uint8_t;
 
 struct VU1State
 {
@@ -37,6 +42,9 @@ struct VU1State
 
 class VU1Interpreter
 {
+    friend struct VU1AotRuntime; // compiled microprograms (runtime/ps2_vu1_aot.h)
+    friend class VU1AotCompiler; // their generator (tools/ps2x_vu1aot.cpp)
+
 public:
     enum class Unit : uint8_t
     {
@@ -61,6 +69,19 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+
+    // Ahead-of-time compiled microcode images (see runtime/ps2_vu1_aot.h). Registered images run compiled when
+    // PS2X_VU1_AOT is not 0. PS2X_VU1_AOT_VERIFY=1 runs every compiled call against the interpreter as well and
+    // reports differences (the interpreter's result is kept). PS2X_VU1_AOT_DUMP=<dir> writes each microcode image
+    // seen, with the entry PCs called, for the generator.
+    static void registerAotImages(const VU1AotImage *images, size_t count);
+    struct AotStats
+    {
+        uint64_t calls = 0, completed = 0, handovers = 0, notCompiled = 0, verified = 0, mismatches = 0;
+        uint64_t compiledCycles = 0, interpretedCycles = 0; // VU cycles run by compiled code / by the interpreter
+    };
+    static AotStats aotStats();
+    static void countAotCycles(uint64_t compiled, uint64_t interpreted);
 
 private:
     enum Pipeline : uint8_t
@@ -242,6 +263,21 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+
+    // Ahead-of-time code: the image for the current microcode generation.
+    uint64_t m_aotGeneration = 0;
+    bool m_aotGenerationValid = false;
+    const VU1AotImage *m_aotImage = nullptr;
+    uint64_t m_aotHash = 0;
+    bool m_aotSuppressed = false; // verify mode: this call is the interpreter reference
+    bool m_aotVerifyCopy = false; // verify mode: this object is the compiled copy
+    // When set, PATH1 packets are appended here (u32 size + bytes); with m_packetPassthrough they are also sent.
+    std::vector<uint8_t> *m_packetCapture = nullptr;
+    bool m_packetPassthrough = false;
+    VU1AotResult tryRunAot(const uint8_t *vuCode, uint32_t codeSize, uint32_t dataSize, PS2Memory *memory,
+                           uint64_t budgetEnd);
+    bool verifyAot(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
+                   uint32_t maxCycles);
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
