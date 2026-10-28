@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -32,7 +33,6 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -51,7 +51,22 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    // Field periods: NTSC 16667 us (the runtime's historical rate), PAL 20000 us (50 Hz).
+    constexpr uint32_t kNtscVBlankMicroseconds = 16667u;
+    constexpr uint32_t kPalVBlankMicroseconds = 20000u;
+
+    // PS2X_VBLANK_HZ=<hz> pins the field rate whatever the video mode (e.g. 60 reproduces runs recorded before the
+    // PAL rate was honoured). Returns 0 when unset.
+    uint32_t vblankOverrideMicroseconds()
+    {
+        static const uint32_t value = []() -> uint32_t
+        {
+            const char *text = std::getenv("PS2X_VBLANK_HZ");
+            const double hz = text ? std::atof(text) : 0.0;
+            return hz > 0.0 ? static_cast<uint32_t>(1000000.0 / hz + 0.5) : 0u;
+        }();
+        return value;
+    }
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -147,8 +162,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    setVBlankPeriodMicroseconds(kNtscVBlankMicroseconds);
+    scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
+                  std::chrono::steady_clock::now() + m_vblankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -1314,6 +1330,26 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
     }
 }
 
+void EeScheduler::setVideoMode(bool pal)
+{
+    setVBlankPeriodMicroseconds(pal ? kPalVBlankMicroseconds : kNtscVBlankMicroseconds);
+}
+
+void EeScheduler::setVBlankPeriodMicroseconds(uint32_t microseconds)
+{
+    if (const uint32_t pinned = vblankOverrideMicroseconds())
+        microseconds = pinned;
+    // Takes effect from the next VBlankStart that is scheduled.
+    m_vblankPeriodMicroseconds = microseconds;
+    m_vblankPeriod = std::chrono::microseconds(microseconds);
+    m_vblankPeriodCycles = microsecondsToEeCycles(microseconds);
+}
+
+double EeScheduler::vblankHz() const noexcept
+{
+    return m_vblankPeriodMicroseconds != 0u ? 1000000.0 / m_vblankPeriodMicroseconds : 0.0;
+}
+
 uint64_t EeScheduler::currentVSyncTick() const noexcept
 {
     return m_vsyncTick;
@@ -1860,8 +1896,8 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
+                              scheduled.hostDeadline + m_vblankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

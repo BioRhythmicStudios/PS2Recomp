@@ -334,6 +334,9 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // Selects the field rate from the video mode (GsSetCrt): PAL 50 Hz, NTSC 60 Hz.
+    void setVideoMode(bool pal);
+    [[nodiscard]] double vblankHz() const noexcept;
     // Guest EE cycles accounted so far (the clock that VBlank and timer events are scheduled on).
     [[nodiscard]] uint64_t currentCycle() const noexcept { return m_eeCycle; }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
@@ -394,6 +397,7 @@ private:
     void waitForEvent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
+    void setVBlankPeriodMicroseconds(uint32_t microseconds);
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
@@ -444,6 +448,9 @@ private:
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;
+    uint32_t m_vblankPeriodMicroseconds = 0;
+    std::chrono::microseconds m_vblankPeriod{0};
+    uint64_t m_vblankPeriodCycles = 0;
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;
     uint32_t m_gsVSyncCallback = 0;

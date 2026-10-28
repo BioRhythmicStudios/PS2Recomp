@@ -521,6 +521,26 @@ void register_ps2_gs_tests()
                      "GsSetCrt should return success");
         });
 
+        tc.Run("GsSetCrt selects the 50 Hz PAL or 60 Hz NTSC VBlank rate", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, 1u); // interlaced
+            setRegU32(ctx, 5, 3u); // PAL
+            setRegU32(ctx, 6, 1u); // frame mode
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.IsTrue(std::fabs(runtime.eeScheduler().vblankHz() - 50.0) < 1e-9,
+                     "PAL should pace VBlank at 50 Hz");
+
+            setRegU32(ctx, 5, 2u); // NTSC
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.IsTrue(std::fabs(runtime.eeScheduler().vblankHz() - 1000000.0 / 16667.0) < 1e-9,
+                     "NTSC should keep the 16667 us VBlank period");
+        });
+
         tc.Run("GsSetCrt programs the SMODE1 CRTC mode for PAL and NTSC", [](TestCase &t)
         {
             PS2Runtime runtime;

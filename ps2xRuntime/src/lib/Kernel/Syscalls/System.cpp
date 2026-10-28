@@ -29,6 +29,8 @@ namespace ps2_syscalls
             if (videoMode == 2 || videoMode == 3)
             {
                 gs.smode1 = 4ull | (32ull << 3) | (1ull << 10) | (static_cast<uint64_t>(videoMode) << 13);
+                // The field rate follows the mode: PAL games are paced by 50 Hz VBlanks.
+                runtime->eeScheduler().setVideoMode(videoMode == 3);
             }
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
