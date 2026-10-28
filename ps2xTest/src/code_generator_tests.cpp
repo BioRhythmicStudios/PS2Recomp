@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -1050,6 +1051,18 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ctx->fcr31 = GPR_U32(ctx, 4) & 0x0183FFFF") != std::string::npos,
                      "CTC1 FCR31 should mask and write fcr31");
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
+        });
+
+        tc.Run("EE SQRT.S reads its operand from ft", [](TestCase &t) {
+            // 0x460C0004 is sqrt.s $f0, $f12 (Maximo's sqrtf at 0x174874): the EE encodes the operand in ft, fs is 0.
+            CodeGenerator gen({}, {});
+            R5900Decoder decoder;
+            const Instruction sqrt = decoder.decodeInstruction(0x174874u, 0x460C0004u);
+
+            const std::string code = gen.translateInstruction(sqrt);
+            printGeneratedCode("EE SQRT.S reads its operand from ft", code);
+            t.IsTrue(code.find("ctx->f[0] = FPU_SQRT_S(ctx->f[12]);") != std::string::npos,
+                     "SQRT.S $f0, $f12 should compute sqrt($f12) into $f0");
         });
 
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
