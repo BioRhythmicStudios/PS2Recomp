@@ -157,6 +157,7 @@ private:
     std::ostringstream m_tables;
     std::map<std::string, int> m_handoverByKey;
     int m_handovers = 0;
+    std::vector<int> m_suspendNodes; // nodes whose top can stop at the cycle budget and continue later
     size_t m_variantOverflows = 0;
 
     Pair decode(uint32_t pc) const { return m_vu->decodeInstructionPair(m_code.data(), pc); }
@@ -395,13 +396,25 @@ private:
                 o << "VU1AotRuntime::commitStore(vu, P.store[" << i << "], " << int(s.store[i].lanes) << ");";
                 s.store[i] = {};
             }
+        // Register commits are whole 16-byte stores (a blend for partial lanes): the next read of the register is a
+        // 16-byte load, which store forwarding cannot serve from four 4-byte stores.
+        auto commitLanes = [&o](const std::string &target, const std::string &value, int blend)
+        {
+            if (blend == 0xF)
+                o << "std::memcpy(" << target << ", " << value << ", 16);";
+            else if (blend != 0)
+                o << "_mm_storeu_ps(" << target << ", _mm_blend_ps(_mm_loadu_ps(" << target << "), _mm_loadu_ps(" << value
+                  << "), " << blend << "));";
+        };
         for (int i = 0; i < 16; ++i)
         {
             AVf &w = s.vf[i];
             if (!w.valid || w.ready > t) continue;
+            int blend = 0; // _mm_blend_ps order: bit c = component c
             for (uint32_t c = 0; c < 4; ++c)
                 if ((w.lanes & laneBit(c)) && s.vfLatest[w.reg][c] == w.seq)
-                    o << "s.vf[" << int(w.reg) << "][" << c << "] = P.vf[" << i << "][" << c << "];";
+                    blend |= 1 << c;
+            commitLanes("s.vf[" + std::to_string(w.reg) + "]", "P.vf[" + std::to_string(i) + "]", blend);
             w = {};
         }
         for (int i = 0; i < 8; ++i)
@@ -416,9 +429,11 @@ private:
         {
             AAcc &w = s.acc[i];
             if (!w.valid || w.ready > t) continue;
+            int blend = 0;
             for (uint32_t c = 0; c < 4; ++c)
                 if ((w.lanes & laneBit(c)) && s.accLatest[c] == w.seq)
-                    o << "s.acc[" << c << "] = P.acc[" << i << "][" << c << "];";
+                    blend |= 1 << c;
+            commitLanes("s.acc", "P.acc[" + std::to_string(i) + "]", blend);
             w = {};
         }
         if (s.kickMaybe)
@@ -835,10 +850,18 @@ void VU1AotCompiler::simulate(const Node &n)
         return;
     }
 
-    // Static stall (calculatePairReadyCycle without the XGKICK term).
+    // Static stall (calculatePairReadyCycle without the XGKICK term). The interpreter runs the pair if its stall ends
+    // before the budget does. At the budget it stops here without running anything, so the compiled code suspends
+    // (the next call continues at this node); a budget that ends inside the stall is left to the interpreter.
     const int stall = readyCycle(s, d);
-    o << "if (cyc + " << (stall + 1) << " >= budgetEnd) ";
-    handoverAt(s, 0, "cycle budget");
+    if (stall > 0)
+    {
+        o << "if (cyc + " << stall << " >= budgetEnd && cyc < budgetEnd) ";
+        handoverAt(s, 0, "cycle budget inside a stall");
+    }
+    o << "if (cyc >= budgetEnd) SUS(" << handoverRef(pc, false, s, 0) << ", " << n.id << ", " << hex(pc)
+      << "u); // cycle budget\n";
+    m_suspendNodes.push_back(n.id);
     if (s.kickMaybe)
     {
         // A malformed GIF tag stops the interpreter at the next pair top.
@@ -1081,7 +1104,9 @@ bool VU1AotCompiler::generate(const std::vector<uint32_t> &entries, uint64_t has
         << "namespace {\n"
         << m_tables.str()
         << "\n#define HO(H, T, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
-           "return VU1AotRuntime::handover(vu, H, cyc + (T), P, L); } while (0)\n\n"
+           "return VU1AotRuntime::handover(vu, H, cyc + (T), P, L); } while (0)\n"
+        << "#define SUS(H, NODE, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
+           "return VU1AotRuntime::suspend(vu, H, cyc, P, L, NODE); } while (0)\n\n"
         << "VU1AotResult run(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
         << "VU1State &s = VU1AotRuntime::state(vu);\n"
         << "uint8_t *const data = VU1AotRuntime::data(vu);\n"
@@ -1091,12 +1116,18 @@ bool VU1AotCompiler::generate(const std::vector<uint32_t> &entries, uint64_t has
         << "float u_[4]; float dummy_[4]; int32_t dummyVi_ = 0;\n"
         << "VU1AotPending P; VU1AotLive L;\n"
         << "(void)dummy_; (void)dummyVi_; (void)cond; (void)data;\n"
+        << "switch (VU1AotRuntime::resumeNode(vu, P, bk, jt, wclip)) {\n"
+        << "case -1: break;\n";
+    std::sort(m_suspendNodes.begin(), m_suspendNodes.end());
+    for (int id : m_suspendNodes)
+        out << "case " << id << ": goto N" << id << ";\n";
+    out << "default: std::abort();\n}\n"
         << "switch (s.pc) {\n";
     for (const auto &[pc, id] : entryNodes)
         if (id >= 0) out << "case " << hex(pc) << "u: goto N" << id << ";\n";
     out << "default: return VU1AotResult::NotCompiled;\n}\n";
     out << m_body.str();
-    out << "}\n#undef HO\n}\n\nextern const VU1AotImage vu1aot_image_" << name << " = {0x" << name << "ull, &run};\n";
+    out << "}\n#undef HO\n#undef SUS\n}\n\nextern const VU1AotImage vu1aot_image_" << name << " = {0x" << name << "ull, &run};\n";
     std::fprintf(stderr, "ps2x_vu1aot %s: %zu nodes, %d handover descriptors, %zu variant-limit exits\n", name,
                  m_nodes.size(), m_handovers, m_variantOverflows);
     return true;

@@ -428,6 +428,12 @@ public:
     static constexpr uint32_t kIntcStatAddress = 0x1000F000u;
     void latchIntcStatus(uint32_t cause);
     void acknowledgeIntcStatus(uint32_t cause);
+    // What read32(kIntcStatAddress) returns, without the address decoding (for host-side polling loops).
+    uint32_t intcStatus() const
+    {
+        const IoRegisterFile::Entry *entry = m_ioRegisters.find(kIntcStatAddress);
+        return entry != nullptr ? entry->second : 0u;
+    }
 
     int pollDmaRegisters();
 

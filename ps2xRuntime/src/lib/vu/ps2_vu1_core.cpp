@@ -93,6 +93,8 @@ void VU1Interpreter::resetScheduler()
     m_stopRequested = false;
     m_pendingHaltD = false;
     m_pendingHaltT = false;
+    m_aotResume.valid = false;
+    m_aotResumeNode = -1;
 }
 
 void VU1Interpreter::reset()

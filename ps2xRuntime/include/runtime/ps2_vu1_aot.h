@@ -19,30 +19,11 @@
 #include <cmath>
 #include <immintrin.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
-// Values of the pipeline entries in flight. Slot indices are the interpreter's slot indices.
-struct VU1AotPending
-{
-    struct Flag
-    {
-        uint32_t mac, status, extraSticky, clip;
-    };
-    struct Store
-    {
-        uint32_t address;
-        uint32_t words[4];
-    };
-    float vf[16][4];
-    int32_t vi[8];
-    float acc[8][4];
-    Flag flag[8];
-    Store store[8];
-    float q;
-    uint32_t qStatusDi;
-    float p[2];
-};
+// VU1AotPending (the values of the pipeline entries in flight) is in runtime/ps2_vu1.h.
 
 // Static pipeline metadata at the top of one instruction pair, relative to that pair's cycle.
 struct VU1AotEntry
@@ -157,6 +138,28 @@ struct VU1AotRuntime
 
     static VU1AotResult handover(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
                                  const VU1AotPending &pending, const VU1AotLive &live);
+    // Writes the pending pipeline entries and the static metadata of `h` into the interpreter.
+    static void materialise(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle, const VU1AotPending &pending,
+                            const VU1AotLive &live);
+    // The cycle budget ran out at the top of node `node`, where the interpreter would stop too. Hands over as above
+    // and also remembers the compiled state, so the next call can continue in compiled code if nothing ran between.
+    static VU1AotResult suspend(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
+                                const VU1AotPending &pending, const VU1AotLive &live, int32_t node);
+    // Called first by every compiled entry: the node to continue at (restoring the pending values and run-time
+    // values saved by suspend), or -1 for a normal entry at the current PC.
+    static int32_t resumeNode(VU1Interpreter &vu, VU1AotPending &pending, int32_t &viBackupValue,
+                              uint32_t &branchTarget, uint32_t &workingClip)
+    {
+        const int32_t node = vu.m_aotResumeNode;
+        if (node < 0)
+            return -1;
+        vu.m_aotResumeNode = -1;
+        pending = vu.m_aotResume.pending;
+        viBackupValue = vu.m_aotResume.viBackupValue;
+        branchTarget = vu.m_aotResume.branchTarget;
+        workingClip = vu.m_aotResume.workingClip;
+        return node;
+    }
 };
 
 namespace vu1aot

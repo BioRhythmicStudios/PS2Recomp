@@ -53,8 +53,10 @@ namespace
 
     std::atomic<uint64_t> g_compiledCycles{0}, g_interpretedCycles{0};
     std::atomic<uint64_t> g_calls{0}, g_completed{0}, g_handovers{0}, g_notCompiled{0}, g_verified{0}, g_mismatches{0};
+    std::atomic<uint64_t> g_suspended{0}, g_resumed{0};
 
-    // PS2X_VU1_AOT_DUMP: each image once, and each (image, entry PC) once.
+    // PS2X_VU1_AOT_DUMP: each image once, and each (image, entry PC) once. JR targets the generator did not know are
+    // recorded the same way (code is null then: the image was written at its first entry).
     void dumpEntry(uint64_t hash, const uint8_t *code, uint32_t codeSize, uint32_t pc)
     {
         static std::mutex mutex;
@@ -64,7 +66,7 @@ namespace
         char name[64];
         std::snprintf(name, sizeof name, "vu1_%016llX", static_cast<unsigned long long>(hash));
         const std::filesystem::path base = std::filesystem::path(config().dumpDir) / name;
-        if (images.insert(hash).second)
+        if (code != nullptr && images.insert(hash).second)
         {
             std::error_code ec;
             std::filesystem::create_directories(config().dumpDir, ec);
@@ -162,8 +164,8 @@ uint64_t VU1AotRuntime::hashCode(const uint8_t *code, uint32_t size)
     return h;
 }
 
-VU1AotResult VU1AotRuntime::handover(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
-                                     const VU1AotPending &pending, const VU1AotLive &live)
+void VU1AotRuntime::materialise(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
+                                const VU1AotPending &pending, const VU1AotLive &live)
 {
     vu.m_cycle = cycle;
     vu.m_state.cycles = cycle;
@@ -301,6 +303,33 @@ VU1AotResult VU1AotRuntime::handover(VU1Interpreter &vu, const VU1AotHandover &h
     s.branchDelay = h.branchDelay;
     s.ebit = h.ebit != 0u;
     s.haltAfterDelaySlot = h.haltAfterDelaySlot != 0u;
+}
+
+VU1AotResult VU1AotRuntime::suspend(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
+                                    const VU1AotPending &pending, const VU1AotLive &live, int32_t node)
+{
+    materialise(vu, h, cycle, pending, live);
+    VU1Interpreter::AotResume &r = vu.m_aotResume;
+    r.valid = true;
+    r.node = node;
+    r.cycle = cycle;
+    r.pc = vu.m_state.pc;
+    r.image = vu.m_aotImage;
+    r.viBackupValue = live.viBackupValue;
+    r.branchTarget = live.branchTarget;
+    r.workingClip = live.workingClip;
+    r.pending = pending;
+    g_suspended.fetch_add(1, std::memory_order_relaxed);
+    return VU1AotResult::Handover;
+}
+
+VU1AotResult VU1AotRuntime::handover(VU1Interpreter &vu, const VU1AotHandover &h, uint64_t cycle,
+                                     const VU1AotPending &pending, const VU1AotLive &live)
+{
+    materialise(vu, h, cycle, pending, live);
+    const VU1State &s = vu.m_state;
+    if (h.pc == VU1AotHandover::kDynamicPc && !config().dumpDir.empty())
+        dumpEntry(vu.m_aotHash, nullptr, 0u, s.pc); // a JR target missing from the image's switch
     const uint64_t handovers = g_handovers.fetch_add(1, std::memory_order_relaxed) + 1u;
     if (config().stats)
     {
@@ -339,6 +368,8 @@ VU1Interpreter::AotStats VU1Interpreter::aotStats()
     s.mismatches = g_mismatches.load(std::memory_order_relaxed);
     s.compiledCycles = g_compiledCycles.load(std::memory_order_relaxed);
     s.interpretedCycles = g_interpretedCycles.load(std::memory_order_relaxed);
+    s.suspended = g_suspended.load(std::memory_order_relaxed);
+    s.resumed = g_resumed.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -352,6 +383,8 @@ VU1AotResult VU1Interpreter::tryRunAot(const uint8_t *vuCode, uint32_t codeSize,
                                        uint64_t budgetEnd)
 {
     const Config &cfg = config();
+    // A suspension can only be continued by the call right after it.
+    const bool resumable = std::exchange(m_aotResume.valid, false);
     if (m_unit != Unit::VU1 || memory == nullptr || vuCode != memory->getVU1Code() || codeSize != PS2_VU1_CODE_SIZE ||
         dataSize != PS2_VU1_DATA_SIZE || (registry().empty() && cfg.dumpDir.empty()))
         return VU1AotResult::NotCompiled;
@@ -374,6 +407,38 @@ VU1AotResult VU1Interpreter::tryRunAot(const uint8_t *vuCode, uint32_t codeSize,
 
     // Compiled code starts from drained pipelines (every MSCAL, and MSCNT after a normal program end).
     g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (resumable && m_aotResume.image == m_aotImage && m_aotResume.cycle == m_cycle && m_aotResume.pc == m_state.pc &&
+        !m_stopRequested)
+    {
+        // Continue after a cycle-budget stop. The compiled code carries the pipeline entries again (they are in
+        // m_aotResume.pending), so the interpreter's copy is dropped, as for a normal entry.
+        m_flagValid = m_storeValid = m_vfWriteValid = m_viWriteValid = m_accWriteValid = 0u;
+        m_flagPipeline = {};
+        m_fdiv = {};
+        m_efu = {};
+        m_storePipeline = {};
+        m_vfWritePipeline = {};
+        m_viWritePipeline = {};
+        m_accWritePipeline = {};
+        m_vfReady = {};
+        m_viReady = {};
+        m_accReady = {};
+        m_vfLatestWrite = {};
+        m_viLatestWrite = {};
+        m_accLatestWrite = {};
+        m_nextCommitCycle = UINT64_MAX;
+        m_viBranchBackupValid = false;
+        m_state.branchPending = false;
+        m_state.ebit = false;
+        m_state.haltAfterDelaySlot = false;
+        m_aotResumeNode = m_aotResume.node;
+        g_resumed.fetch_add(1, std::memory_order_relaxed);
+        const VU1AotResult result = m_aotImage->entry(*this, budgetEnd);
+        m_aotResumeNode = -1;
+        if (result == VU1AotResult::Completed)
+            g_completed.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
     if (m_flagValid | m_storeValid | m_vfWriteValid | m_viWriteValid | m_accWriteValid || m_fdiv.valid ||
         m_efu[0].valid || m_efu[1].valid || m_xgkick.active || m_state.branchPending || m_state.ebit ||
         m_state.haltAfterDelaySlot || m_viBranchBackupValid || m_stopRequested)
@@ -404,11 +469,14 @@ bool VU1Interpreter::verifyAot(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuDa
     compiled->m_aotVerifyCopy = true;
     compiled->m_packetCapture = &compiledPackets;
     compiled->m_packetPassthrough = false;
-    const uint64_t completedBefore = g_completed.load(), handoversBefore = g_handovers.load();
+    const uint64_t completedBefore = g_completed.load(), handoversBefore = g_handovers.load(),
+                   suspendedBefore = g_suspended.load();
     compiled->run(vuCode, codeSize, compiledData.data(), dataSize, gs, memory, maxCycles);
-    const bool ranCompiled = g_completed.load() != completedBefore || g_handovers.load() != handoversBefore;
+    const bool ranCompiled = g_completed.load() != completedBefore || g_handovers.load() != handoversBefore ||
+                             g_suspended.load() != suspendedBefore;
 
     m_aotSuppressed = true;
+    m_aotResume.valid = false; // the reference interprets
     m_packetCapture = &referencePackets;
     m_packetPassthrough = true;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
@@ -478,5 +546,7 @@ bool VU1Interpreter::verifyAot(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuDa
                                                     << ": " << what << " differ (compiled cycles " << compiled->m_cycle
                                                     << ", interpreter " << m_cycle << ")\n");
     }
+    else if (compiled->m_aotResume.valid)
+        m_aotResume = compiled->m_aotResume; // same state: the next call may continue in compiled code (and verify it)
     return true;
 }

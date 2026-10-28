@@ -12,6 +12,29 @@ struct VU1AotImage;
 struct VU1AotRuntime;
 enum class VU1AotResult : uint8_t;
 
+// Values of the pipeline entries in flight in compiled VU1 code (runtime/ps2_vu1_aot.h). Slot indices are the
+// interpreter's slot indices.
+struct VU1AotPending
+{
+    struct Flag
+    {
+        uint32_t mac, status, extraSticky, clip;
+    };
+    struct Store
+    {
+        uint32_t address;
+        uint32_t words[4];
+    };
+    float vf[16][4];
+    int32_t vi[8];
+    float acc[8][4];
+    Flag flag[8];
+    Store store[8];
+    float q;
+    uint32_t qStatusDi;
+    float p[2];
+};
+
 struct VU1State
 {
     float vf[32][4];
@@ -79,6 +102,7 @@ public:
     {
         uint64_t calls = 0, completed = 0, handovers = 0, notCompiled = 0, verified = 0, mismatches = 0;
         uint64_t compiledCycles = 0, interpretedCycles = 0; // VU cycles run by compiled code / by the interpreter
+        uint64_t suspended = 0, resumed = 0; // cycle-budget stops, and continuations in compiled code
     };
     static AotStats aotStats();
     static void countAotCycles(uint64_t compiled, uint64_t interpreted);
@@ -271,6 +295,23 @@ private:
     uint64_t m_aotHash = 0;
     bool m_aotSuppressed = false; // verify mode: this call is the interpreter reference
     bool m_aotVerifyCopy = false; // verify mode: this object is the compiled copy
+    // Compiled code stopped by the cycle budget (VU1AotRuntime::suspend). The interpreter state is materialised as for
+    // any handover; if the next run() starts at the same cycle and PC with nothing run in between, compiled code
+    // continues at `node` with these values instead.
+    struct AotResume
+    {
+        bool valid = false;
+        int32_t node = 0;
+        uint64_t cycle = 0;
+        uint32_t pc = 0;
+        const VU1AotImage *image = nullptr;
+        int32_t viBackupValue = 0;
+        uint32_t branchTarget = 0;
+        uint32_t workingClip = 0;
+        VU1AotPending pending{};
+    };
+    AotResume m_aotResume;
+    int32_t m_aotResumeNode = -1; // set by tryRunAot for VU1AotRuntime::resumeNode
     // When set, PATH1 packets are appended here (u32 size + bytes); with m_packetPassthrough they are also sent.
     std::vector<uint8_t> *m_packetCapture = nullptr;
     bool m_packetPassthrough = false;
