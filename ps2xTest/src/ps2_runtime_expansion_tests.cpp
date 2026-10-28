@@ -1555,6 +1555,23 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(mem.read32(0x10002020u) & 0x7Fu, 8u, "IPU_BP should hold the bit position");
         });
 
+        tc.Run("toIPU chain started with QWC=0 reads a new tag even when CHCR.TAG is refe", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "memory should initialize");
+            uint8_t *ram = mem.getRDRAM();
+            const uint64_t refeTag = (0ull << 28) | 1ull | (0x2000ull << 32);
+            std::memcpy(ram + 0x1000, &refeTag, 8);
+            const uint8_t data[16] = {0x00, 0x00, 0x01, 0xB7};
+            std::memcpy(ram + 0x2000, data, 16);
+            mem.write32(0x1000B430u, 0x1000u); // TADR
+            mem.write32(0x1000B420u, 0u);      // QWC
+            mem.write32(0x1000B400u, 0x105u);  // CHCR: chain, STR, TAG field 0 (refe)
+            mem.write32(0x10002000u, 0x40000000u); // FDEC FB=0
+            t.Equals(mem.read64(0x10002000u), 0x000001B7ull, "the tagged block should reach the IPU");
+            t.Equals(mem.read32(0x1000B400u) & 0x100u, 0u, "the channel should finish at the refe tag");
+        });
+
         tc.Run("toSPR source chain copies each tagged block to the scratchpad", [](TestCase &t)
         {
             PS2Memory mem;

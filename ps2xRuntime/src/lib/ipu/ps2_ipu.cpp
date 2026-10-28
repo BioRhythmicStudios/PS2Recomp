@@ -443,9 +443,12 @@ void Ps2Ipu::dmaControlWritten(uint32_t channelBase)
     {
         // A chain (re)start continues from TADR unless CHCR.TAG holds an ending tag (refe, end, or
         // IRQ with TIE): then only the remaining QWC moves. Sony's MPEG library restores a paused
-        // chain this way and sets TAG to ref when it wants the chain to go on.
+        // chain this way and sets TAG to ref when it wants the chain to go on. With QWC=0 nothing is
+        // left of the old tag, so the DMAC reads a new tag from TADR whatever CHCR.TAG holds.
         const uint32_t tagId = (chcr >> 28) & 7u;
-        m_toIpuChainEnded = tagId == 0u || tagId == 7u || ((chcr >> 31) != 0u && (chcr & 0x80u) != 0u);
+        const bool resuming = (reg(channelBase + 0x20u) & 0xFFFFu) != 0u;
+        m_toIpuChainEnded =
+            resuming && (tagId == 0u || tagId == 7u || ((chcr >> 31) != 0u && (chcr & 0x80u) != 0u));
         m_toIpuAsp = (chcr >> 4) & 3u;
         if (traceEnabled())
             std::fprintf(stderr, "[ipu] toIPU start chcr=0x%08X madr=0x%08X qwc=%u tadr=0x%08X\n", chcr,
