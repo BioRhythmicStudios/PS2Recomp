@@ -1802,6 +1802,17 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // The run loop calls this around every guest function it dispatches, about a million times a second. Almost
+    // always nothing is due: no event posted (postEvent() sets m_checkpointPending), no deadline cycle reached
+    // (m_nextDeadlineCycle is never later than the earliest deadline), no timer interrupt and no preemption. Then
+    // the full pass below would change nothing, so it is skipped.
+    if (!m_checkpointPending.load(std::memory_order_acquire) && m_pendingEeTimerInterrupts == 0u &&
+        !m_rescheduleRequested)
+    {
+        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextEventCycle == 0u || m_eeCycle < nextEventCycle)
+            return;
+    }
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
