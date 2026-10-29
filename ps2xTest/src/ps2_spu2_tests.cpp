@@ -169,6 +169,34 @@ void register_ps2_spu2_tests()
             t.Equals(static_cast<int>(sd.spu2.activeVoices()), 0, "key-off releases the voice");
         });
 
+        tc.Run("sceSdInit keeps the samples already in sound RAM", [](TestCase &t)
+        {
+            // Maximo uploads its resident bank in the front end, then calls sceSdInit(0) again when a level starts.
+            Libsd sd;
+            sd.call(4, 0u);
+            const std::vector<uint8_t> sample = constantBlock(0x4u, 0u, 3u); // loop end + repeat
+            t.IsTrue(sd.memory.writeRam(0x20000u, sample.data(), sample.size()), "stage the sample in IOP RAM");
+            sd.memory.write32(0x1000u + 16u, static_cast<uint32_t>(sample.size()));
+            t.Equals(sd.call(17, 0u, 8u, 0x20000u, 0x30000u), static_cast<uint32_t>(sample.size()),
+                     "I/O-mode transfer to SPU 0x30000");
+            sd.call(4, 0u); // the level's sceSdInit(0)
+
+            const uint32_t voice = 5u << 1u; // core 0, voice 5
+            sd.call(9, 0x2000u | voice, 0x30000u); // SSA
+            sd.call(5, 0x0200u | voice, 0x1000u);  // PITCH
+            sd.call(5, 0x0300u | voice, 0x000Fu);  // ADSR1
+            sd.call(5, 0x0000u | voice, 0x3FFFu);  // VOLL
+            sd.call(5, 0x0100u | voice, 0x3FFFu);  // VOLR
+            for (const uint32_t master : {0x0980u, 0x0A80u, 0x0981u, 0x0A81u})
+                sd.call(5, master, 0x3FFFu);
+            sd.call(7, 0x1500u, 1u << 5u); // KON voice 5
+
+            std::vector<int16_t> out;
+            sd.spu2.run(80u, out);
+            t.IsTrue(*std::max_element(out.begin(), out.end()) > 0x1000, "the sample transferred before sceSdInit plays");
+            t.Equals(static_cast<int>(sd.spu2.activeVoices()), 1, "the voice is on");
+        });
+
         tc.Run("DMA voice transfers complete through the transfer callback", [](TestCase &t)
         {
             Libsd sd;

@@ -112,7 +112,9 @@ namespace ps2x::iop::detail
         if (resetHardware)
         {
             // sceSdInit(0) resets the SPU2: every voice keyed off, pitch modulation and noise off, master volume 0.
-            m_spu2.reset();
+            // LIBSD writes registers only: sound RAM keeps what was transferred before (Maximo uploads its resident
+            // sample bank in the front end and calls sceSdInit again when a level starts).
+            m_spu2.resetRegisters();
             for (uint32_t core = 0; core < 2u; ++core)
             {
                 m_spu2.write16(core * kCoreStride + 0x1A4u, 0xFFFFu); // KOFF

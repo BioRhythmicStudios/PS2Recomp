@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -250,11 +251,16 @@ namespace ps2x::iop::detail
     void IopSpu2::reset()
     {
         std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
+        resetRegisters();
+        m_samples = 0u;
+        m_keyOns = 0u;
+    }
+
+    void IopSpu2::resetRegisters()
+    {
         m_regs.fill(0u);
         for (Core &core : m_cores)
             core = Core{};
-        m_samples = 0u;
-        m_keyOns = 0u;
     }
 
     uint32_t IopSpu2::activeVoices() const noexcept
@@ -470,6 +476,40 @@ namespace ps2x::iop::detail
         }
     }
 
+    std::string IopSpu2::describeVoice(uint32_t coreIndex, uint32_t voiceIndex) const
+    {
+        const Core &core = m_cores[coreIndex & 1u];
+        const Voice &voice = core.voices[voiceIndex % VoicesPerCore];
+        const uint32_t bit = 1u << (voiceIndex % VoicesPerCore);
+        uint8_t block[16];
+        readRam((voice.block & kAddressMask) * 2u, block, sizeof(block));
+        uint32_t nonzero = 0u; // data bytes (not block headers) that are not zero, over the next 64 blocks
+        for (uint32_t b = 0; b < 64u; ++b)
+        {
+            uint8_t data[16];
+            readRam(((voice.block + 8u * b) & kAddressMask) * 2u, data, sizeof(data));
+            for (uint32_t i = 2u; i < 16u; ++i)
+                nonzero += data[i] != 0u ? 1u : 0u;
+        }
+        char text[400];
+        std::snprintf(text, sizeof text,
+                      "core %u voice %2u: SSA 0x%05X LSAX 0x%05X pitch 0x%04X ADSR %04X/%04X env %u:%04X VOL %04X/%04X "
+                      "(now %d/%d) mix dry %c%c wet %c%c PMON %u NON %u MMIX %04X MVOL %d/%d ENDX %u | block %02X %02X "
+                      "(%u nonzero data bytes in 64 blocks)",
+                      coreIndex & 1u, voiceIndex % VoicesPerCore, voice.ssa * 2u, voice.lsax * 2u, voice.pitch,
+                      voice.adsr1, voice.adsr2, voice.envelope.phase, voice.envelope.level, voice.left.reg,
+                      voice.right.reg, voice.left.current, voice.right.current, (core.vmixl & bit) ? 'L' : '-',
+                      (core.vmixr & bit) ? 'R' : '-', (core.vmixel & bit) ? 'L' : '-', (core.vmixer & bit) ? 'R' : '-',
+                      (core.pmon & bit) ? 1u : 0u, (core.non & bit) ? 1u : 0u, core.mmix, core.masterLeft.current,
+                      core.masterRight.current, (core.endx & bit) ? 1u : 0u, block[0], block[1], nonzero);
+        return text;
+    }
+
+    int32_t IopSpu2::voicePeak(uint32_t core, uint32_t voice) const
+    {
+        return m_cores[core & 1u].voices[voice % VoicesPerCore].peak;
+    }
+
     void IopSpu2::keyOn(Core &core, uint32_t bits)
     {
         for (uint32_t v = 0; v < VoicesPerCore; ++v)
@@ -486,6 +526,7 @@ namespace ps2x::iop::detail
             voice.lsaxWritten = false;
             voice.envelope = Envelope{0, 0, 1};
             voice.output = 0;
+            voice.peak = 0;
             core.endx &= ~(1u << v);
             ++m_keyOns;
         }
@@ -613,6 +654,7 @@ namespace ps2x::iop::detail
             sample = clamp16((sample * voice.envelope.level) >> 15);
             tickAdsr(voice.envelope, voice.adsr1, voice.adsr2);
             voice.output = sample;
+            voice.peak = std::max(voice.peak, std::abs(sample));
             previousOutput = sample;
 
             const int32_t left = (sample * voice.left.current) >> 15;

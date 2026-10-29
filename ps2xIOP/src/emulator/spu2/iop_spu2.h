@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -21,6 +22,9 @@ namespace ps2x::iop::detail
         IopSpu2();
 
         void reset();
+        // Resets the register file and every voice, as the SPU2's reset does, but keeps sound RAM and the sample
+        // count: sceSdInit reinitialises the chip without touching the samples a driver has already transferred.
+        void resetRegisters();
 
         [[nodiscard]] uint16_t read16(uint32_t offset) const;
         void write16(uint32_t offset, uint16_t value);
@@ -35,6 +39,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint64_t samplesMixed() const noexcept { return m_samples; }
         [[nodiscard]] uint32_t activeVoices() const noexcept;
         [[nodiscard]] uint64_t keyOns() const noexcept { return m_keyOns; }
+        // One line describing a voice's registers, envelope and the ADPCM block it plays next (diagnostics).
+        [[nodiscard]] std::string describeVoice(uint32_t core, uint32_t voice) const;
+        // The largest output (after the envelope, before volume) a voice has produced since its last key-on.
+        [[nodiscard]] int32_t voicePeak(uint32_t core, uint32_t voice) const;
 
         // The envelope and interpolation helpers are public for unit tests.
         struct Envelope
@@ -79,6 +87,7 @@ namespace ps2x::iop::detail
             std::array<int16_t, 4> previous{}; // previous[0] is the newest
             Envelope envelope;
             int32_t output = 0; // last voice output (after envelope), drives pitch modulation
+            int32_t peak = 0;   // largest |output| since the last key-on (diagnostics)
         };
 
         struct Core
