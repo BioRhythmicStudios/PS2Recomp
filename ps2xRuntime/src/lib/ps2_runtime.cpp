@@ -390,6 +390,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    // PS2X_PRESENT_FILTER=linear: bilinear scaling to the window instead of nearest-neighbour (the default).
+    static const bool s_linearFilter = [] {
+        const char *v = std::getenv("PS2X_PRESENT_FILTER");
+        return v && std::strcmp(v, "linear") == 0;
+    }();
+    static unsigned int s_filteredTextureId = 0u;
+    if (s_linearFilter && tex.id != s_filteredTextureId)
+    {
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+        s_filteredTextureId = tex.id;
+    }
 
     if (const auto &source = rt->hostFrameSource())
     {
@@ -397,6 +408,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         if (source(s_scratch, width, height) && width != 0u && height != 0u &&
             s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
         {
+            // A frame larger than the GS framebuffer (high-resolution scanout) gets a texture of its own size;
+            // frames that fit keep the framebuffer-sized texture.
+            const bool large = width > FB_WIDTH || height > FB_HEIGHT;
+            const int texWidth = large ? static_cast<int>(width) : FB_WIDTH;
+            const int texHeight = large ? static_cast<int>(height) : FB_HEIGHT;
+            if (tex.width != texWidth || tex.height != texHeight)
+            {
+                UnloadTexture(tex);
+                Image blank = GenImageColor(texWidth, texHeight, BLANK);
+                tex = LoadTextureFromImage(blank);
+                UnloadImage(blank);
+                if (s_linearFilter)
+                {
+                    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+                    s_filteredTextureId = tex.id;
+                }
+            }
+            if (large)
+            {
+                UpdateTexture(tex, s_scratch.data());
+                s_lastWidth = width;
+                s_lastHeight = height;
+                s_hasUploadedFrame = true;
+                outWidth = s_lastWidth;
+                outHeight = s_lastHeight;
+                return;
+            }
             std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
             const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
             const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
