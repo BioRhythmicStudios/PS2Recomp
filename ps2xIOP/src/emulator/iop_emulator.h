@@ -41,6 +41,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+        // Host-time counters for performance reports. The maxima cover the time since the previous call.
+        void hostTiming(HostTiming &timing) const noexcept;
 
     private:
         class Impl;

@@ -217,6 +217,28 @@ void register_ps2_spu2_tests()
             t.IsFalse(sd.lastCallback.has_value(), "programmed I/O completes without an interrupt");
         });
 
+        tc.Run("IOP time spent serving RPCs comes out of the EE-granted clock", [](TestCase &t)
+        {
+            // The SPU2's sample clock is IOP time, so IOP time must not run ahead of EE time / 8 when an emulated
+            // module serves the EE synchronously.
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem iop(host);
+            const uint32_t sid = 0x00012345u;
+            iop_test::rpcServer(sid, 0x1234u).install(host, 0x1000u);
+            t.IsTrue(iop.loadModuleBuffer(0x1000u).moduleId > 0, "RPC server loads");
+            ps2x::iop::RpcRequest request{};
+            request.sid = sid;
+            request.receive = {0x800u, 4u};
+            for (int i = 0; i < 100; ++i)
+                t.IsTrue(iop.handleRpc(request).handled, "the server answers");
+            const uint64_t served = iop.emulatorCycles();
+            t.IsTrue(served > 100u, "serving takes IOP cycles");
+            iop.runEeCycles(8u); // one IOP cycle granted: the IOP is already ahead and must not advance
+            t.Equals(iop.emulatorCycles(), served, "an IOP ahead of the EE waits");
+            iop.runEeCycles(8u * (served + 1000u));
+            t.Equals(iop.emulatorCycles(), served + 1001u, "IOP cycles equal the EE's grant once it catches up");
+        });
+
         tc.Run("IRX modules start with argc and argv", [](TestCase &t)
         {
             iop_test::Host host;

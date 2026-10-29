@@ -482,9 +482,29 @@ public:
     void setIopAudioSink(IopAudioSink sink) { m_iopAudioSink = std::move(sink); }
     const IopAudioSink &iopAudioSink() const { return m_iopAudioSink; }
     // Plays the emulated IOP's SPU2 output on the host audio device (windowed runs: the device opens with the
-    // window). The output is buffered about 50 ms behind the guest.
+    // window). The output is buffered about 60 ms behind the guest.
     void setIopAudioPlayback(bool enabled) { m_iopAudioPlayback = enabled; }
     void playIopAudio(const int16_t *samples, size_t frames);
+    // Host playback counters since the previous call (frames are 48 kHz stereo frames).
+    struct IopAudioStats
+    {
+        uint64_t callbacks = 0;
+        uint64_t framesRequested = 0; // by the audio device
+        uint64_t silentFrames = 0;    // of those, played as silence (not started yet, or the ring ran dry)
+        uint64_t framesQueued = 0;    // produced by the SPU2
+        uint64_t droppedFrames = 0;
+        uint64_t underruns = 0;
+        uint64_t minBuffered = 0;
+        uint64_t maxBuffered = 0;
+        uint64_t buffered = 0;
+        uint64_t maxCallbackGapUs = 0;
+        int32_t pacingPpm = 0;
+    };
+    IopAudioStats takeIopAudioStats();
+    // While host playback runs: true, with the VBlank pacing correction (parts per million of the period; positive
+    // slows the guest) that keeps the playback ring at its target fill, and whether lost time should be made up
+    // (the ring is below its target).
+    bool iopAudioPacing(int32_t &ppm, bool &catchUp) const;
     [[nodiscard]] uint64_t iopAudioUnderruns() const;
     [[nodiscard]] uint64_t iopAudioDroppedFrames() const;
     inline VU1Interpreter &vu0() { return m_vu0; }

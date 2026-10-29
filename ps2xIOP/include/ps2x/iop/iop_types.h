@@ -142,6 +142,19 @@ namespace ps2x::iop
         std::vector<DebugMetric> metrics;
     };
 
+    // Host time spent interpreting IOP code (slices that were not skipped as idle) and mixing SPU2 output
+    // (spu2Ns includes outputNs, the time inside IopHost::audioOutput). The maxima are per snapshot.
+    struct HostTiming
+    {
+        uint64_t runNs = 0;
+        uint64_t activeRuns = 0;
+        uint64_t spu2Ns = 0;
+        uint64_t spu2MaxNs = 0;
+        uint64_t outputNs = 0;
+        uint64_t outputMaxNs = 0;
+        uint64_t spu2Samples = 0;
+    };
+
     struct DebugSnapshot
     {
         uint64_t emulatorCycles = 0;
@@ -149,6 +162,7 @@ namespace ps2x::iop
         uint32_t emulatorLoadedModules = 0;
         uint32_t emulatorThreads = 0;
         uint32_t emulatorRpcServers = 0;
+        HostTiming hostTiming;
         std::vector<DebugService> services;
         std::vector<std::string> diagnostics;
     };

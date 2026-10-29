@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <optional>
@@ -143,6 +144,7 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            eeClockCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
             activeCpu = nullptr;
@@ -360,6 +362,9 @@ namespace ps2x::iop::detail
                 syncSpu2();
                 std::optional<IopLibsd::Callback> callback;
                 const std::array<uint32_t, 4> arguments{cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
+                if (call.ordinal == 7u && ((cpu.gpr[4] >> 8u) & 0xFFu) == 0x15u) // KON: keep each voice's last peak
+                    for (uint32_t v = 0; v < IopSpu2::VoicesPerCore; ++v)
+                        peakBeforeKeyOn[(cpu.gpr[4] & 1u) * IopSpu2::VoicesPerCore + v] = spu2.voicePeak(cpu.gpr[4] & 1u, v);
                 (void)libsd.dispatchImport(call.ordinal, cpu, totalCycles, callback);
                 // PS2X_LIBSD_TRACE=<n>: log the first n calls of each libsd function.
                 static const uint64_t traceLimit = []
@@ -374,6 +379,42 @@ namespace ps2x::iop::detail
                         << ", 0x" << arguments[1] << ", 0x" << arguments[2] << ", 0x" << arguments[3] << ") -> 0x"
                         << cpu.gpr[2] << " ra=0x" << cpu.gpr[31] << " sample=" << std::dec << spu2.samplesMixed();
                     log(LogLevel::Debug, out.str());
+                }
+                // PS2X_SPU2_KON_TRACE=<n>: describe the first n voices keyed on (sceSdSetSwitch KON), and the first n
+                // voice transfers.
+                static const uint64_t konTraceLimit = []
+                {
+                    const char *value = std::getenv("PS2X_SPU2_KON_TRACE");
+                    return value ? std::strtoull(value, nullptr, 0) : 0ull;
+                }();
+                if (konTraceLimit != 0u)
+                {
+                    static uint64_t traced = 0u, transfers = 0u;
+                    if (call.ordinal == 7u && ((arguments[0] >> 8u) & 0xFFu) == 0x15u)
+                    {
+                        for (uint32_t v = 0; v < IopSpu2::VoicesPerCore && traced < konTraceLimit; ++v)
+                        {
+                            if ((arguments[1] & (1u << v)) == 0u)
+                                continue;
+                            ++traced;
+                            std::ostringstream out;
+                            out << "[IOP:spu2] KON #" << traced << " sample " << spu2.samplesMixed() << " ra=0x"
+                                << std::hex << cpu.gpr[31] << std::dec << ": "
+                                << spu2.describeVoice(arguments[0] & 1u, v) << " | previous sound's peak "
+                                << peakBeforeKeyOn[(arguments[0] & 1u) * IopSpu2::VoicesPerCore + v];
+                            log(LogLevel::Info, out.str());
+                        }
+                    }
+                    else if (call.ordinal == 17u && transfers < konTraceLimit)
+                    {
+                        ++transfers;
+                        std::ostringstream out;
+                        out << "[IOP:spu2] VoiceTrans #" << transfers << " sample " << spu2.samplesMixed() << " ch "
+                            << (arguments[0] & 1u) << " mode 0x" << std::hex << arguments[1] << " IOP 0x" << arguments[2]
+                            << " -> SPU 0x" << arguments[3] << " size 0x" << memory.read32(cpu.gpr[29] + 16u)
+                            << " -> 0x" << cpu.gpr[2];
+                        log(LogLevel::Info, out.str());
+                    }
                 }
                 if (call.ordinal == 4u)
                 {
@@ -564,16 +605,30 @@ namespace ps2x::iop::detail
                 return;
             spu2LastSync = totalCycles;
             const uint64_t target = (totalCycles - spu2Epoch) / IopSpu2::IopCyclesPerSample;
+            if (spu2.samplesMixed() >= target)
+                return;
+            const auto mixStart = std::chrono::steady_clock::now();
             while (spu2.samplesMixed() < target)
             {
                 const uint64_t frames = std::min<uint64_t>(target - spu2.samplesMixed(), 4096u);
                 spu2.run(static_cast<uint32_t>(frames), audioOut);
                 if (audioOut.size() >= kSpu2OutputFrames * 2u)
                 {
+                    const auto outputStart = std::chrono::steady_clock::now();
                     host.audioOutput(audioOut.data(), audioOut.size() / 2u);
                     audioOut.clear();
+                    const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                  std::chrono::steady_clock::now() - outputStart)
+                                                                  .count());
+                    hostOutputNs += ns;
+                    hostOutputMaxNs = std::max(hostOutputMaxNs, ns);
                 }
             }
+            const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                          std::chrono::steady_clock::now() - mixStart)
+                                                          .count());
+            hostSpu2Ns += ns;
+            hostSpu2MaxNs = std::max(hostSpu2MaxNs, ns);
         }
 
         void servicePendingGuestCallbacks()
@@ -628,6 +683,8 @@ namespace ps2x::iop::detail
                     return;
                 }
                 idleUntil = 0;
+                const auto runStart = std::chrono::steady_clock::now();
+                ++hostActiveRuns;
                 while (totalCycles < target)
                 {
                     servicePendingDmaInterrupts();
@@ -653,6 +710,9 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                hostRunNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                       std::chrono::steady_clock::now() - runStart)
+                                                       .count());
             }
             catch (...)
             {
@@ -793,6 +853,7 @@ namespace ps2x::iop::detail
         uint64_t spu2Epoch = 0;    // IOP cycle of SPU2 sample 0
         uint64_t spu2LastSync = 0; // IOP cycle of the last SPU2 sync
         std::vector<int16_t> audioOut;
+        std::array<int32_t, 2u * IopSpu2::VoicesPerCore> peakBeforeKeyOn{}; // PS2X_SPU2_KON_TRACE diagnostics
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
@@ -802,11 +863,21 @@ namespace ps2x::iop::detail
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
+        // IOP cycles the EE has granted so far (EE cycles / 8). Code run synchronously for the EE (RPC server
+        // functions, module start) also advances totalCycles, so the IOP only runs while it is behind this clock;
+        // otherwise every such call would push IOP time, and the SPU2 sample clock with it, ahead of the EE.
+        uint64_t eeClockCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         // runCycles: no thread is ready and no event is due before this cycle (0: unknown). Only time has passed since
         // it was computed: every entry point that can change IOP state clears it.
         uint64_t idleUntil = 0;
+        uint64_t hostRunNs = 0;     // host time in runCycles slices that were not skipped as idle
+        uint64_t hostActiveRuns = 0;
+        uint64_t hostSpu2Ns = 0;    // host time mixing SPU2 output, including handing it to the host
+        uint64_t hostSpu2MaxNs = 0; // longest single SPU2 sync since the last hostTiming() call
+        uint64_t hostOutputNs = 0;  // of hostSpu2Ns, time inside IopHost::audioOutput
+        uint64_t hostOutputMaxNs = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -851,10 +922,10 @@ namespace ps2x::iop::detail
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
+        m_impl->eeClockCycles += total / 8u;
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        if (m_impl->totalCycles < m_impl->eeClockCycles)
+            m_impl->runCycles(m_impl->eeClockCycles - m_impl->totalCycles);
         if (m_impl->libsd.initialized() && m_impl->totalCycles - m_impl->spu2LastSync >= kSpu2SyncCycles)
         {
             try
@@ -936,6 +1007,17 @@ namespace ps2x::iop::detail
     uint64_t IopEmulator::instructions() const noexcept
     {
         return m_impl->totalInstructions;
+    }
+
+    void IopEmulator::hostTiming(HostTiming &timing) const noexcept
+    {
+        timing.runNs = m_impl->hostRunNs;
+        timing.activeRuns = m_impl->hostActiveRuns;
+        timing.spu2Ns = m_impl->hostSpu2Ns;
+        timing.spu2MaxNs = std::exchange(m_impl->hostSpu2MaxNs, 0u);
+        timing.outputNs = m_impl->hostOutputNs;
+        timing.outputMaxNs = std::exchange(m_impl->hostOutputMaxNs, 0u);
+        timing.spu2Samples = m_impl->spu2.samplesMixed();
     }
 
     uint32_t IopEmulator::loadedModuleCount() const noexcept

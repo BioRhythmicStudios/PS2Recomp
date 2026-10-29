@@ -510,24 +510,54 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
 namespace
 {
-    // Host playback of the IOP's SPU2 output: the EE thread writes guest-timed samples into a ring, and the
-    // audio device's callback reads them. Playback starts once 50 ms are buffered; a dry ring plays silence
-    // (an underrun) and waits for 50 ms again; more than 250 ms buffered (the guest running ahead of real time)
-    // drops the oldest samples back to 50 ms.
+    // Host playback of the IOP's SPU2 output. The EE thread (the producer) appends guest-timed frames to a lock-free
+    // single-producer/single-consumer ring and the audio device's callback (the consumer) takes them: neither side
+    // blocks, locks or allocates. Playback starts once kTargetFrames (60 ms) are queued; a dry ring plays silence
+    // (an underrun) until kTargetFrames are queued again. The ring is bounded: frames that do not fit are dropped and
+    // counted. Nothing is resampled, duplicated or skipped. Instead, the guest is kept at the device's real-time rate:
+    // the callback turns the ring's average fill into a pacing correction of at most 0.5% that EeScheduler applies to
+    // the VBlank period (iopAudioPacing), so the guest's 48 kHz runs at the device's 48 kHz.
     struct IopAudioPlayer
     {
-        static constexpr size_t kCapacityFrames = 48000u;
-        static constexpr size_t kStartFrames = 2400u;
-        static constexpr size_t kMaxFrames = 12000u;
-        std::mutex mutex;
+        static constexpr uint64_t kCapacityFrames = 16384u; // 341 ms; a power of two
+        static constexpr uint64_t kTargetFrames = 2880u;    // 60 ms
+        static constexpr int32_t kMaxPacingPpm = 5000;      // 0.5%
         std::vector<int16_t> ring = std::vector<int16_t>(kCapacityFrames * 2u);
-        size_t readFrame = 0;
-        size_t buffered = 0;
-        bool playing = false;
+        std::atomic<uint64_t> written{0}; // frames, monotonic; advanced only by the producer
+        std::atomic<uint64_t> read{0};    // frames, monotonic; advanced only by the consumer
+        std::atomic<bool> playing{false};
+        std::atomic<int32_t> pacingPpm{0};
         bool started = false;
-        uint64_t underruns = 0;
-        uint64_t dropped = 0;
         AudioStream stream{};
+
+        // Consumer-only state.
+        double averageFill = static_cast<double>(kTargetFrames);
+        std::chrono::steady_clock::time_point lastCallback{};
+
+        // Statistics: totals, and a window that takeIopAudioStats() resets.
+        std::atomic<uint64_t> underruns{0}, dropped{0};
+        std::atomic<uint64_t> wCallbacks{0}, wRequested{0}, wSilent{0}, wQueued{0}, wDropped{0}, wUnderruns{0};
+        std::atomic<uint64_t> wMinFill{UINT64_MAX}, wMaxFill{0}, wMaxGapUs{0};
+
+        static void atomicMin(std::atomic<uint64_t> &value, uint64_t candidate)
+        {
+            uint64_t current = value.load(std::memory_order_relaxed);
+            while (candidate < current && !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed))
+            {
+            }
+        }
+        static void atomicMax(std::atomic<uint64_t> &value, uint64_t candidate)
+        {
+            uint64_t current = value.load(std::memory_order_relaxed);
+            while (candidate > current && !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed))
+            {
+            }
+        }
+        void noteFill(uint64_t fill)
+        {
+            atomicMin(wMinFill, fill);
+            atomicMax(wMaxFill, fill);
+        }
     };
 
     IopAudioPlayer &iopAudioPlayer()
@@ -540,26 +570,63 @@ namespace
     {
         IopAudioPlayer &p = iopAudioPlayer();
         int16_t *out = static_cast<int16_t *>(buffer);
-        std::lock_guard<std::mutex> lock(p.mutex);
-        if (!p.playing && p.buffered >= IopAudioPlayer::kStartFrames)
-            p.playing = true;
-        for (unsigned int i = 0; i < frames; ++i)
+        const auto now = std::chrono::steady_clock::now();
+        if (p.lastCallback != std::chrono::steady_clock::time_point{})
+            IopAudioPlayer::atomicMax(p.wMaxGapUs, static_cast<uint64_t>(
+                                                       std::chrono::duration_cast<std::chrono::microseconds>(now - p.lastCallback).count()));
+        p.lastCallback = now;
+        p.wCallbacks.fetch_add(1u, std::memory_order_relaxed);
+        p.wRequested.fetch_add(frames, std::memory_order_relaxed);
+
+        const uint64_t read = p.read.load(std::memory_order_relaxed);
+        const uint64_t available = p.written.load(std::memory_order_acquire) - read;
+        p.noteFill(available);
+        bool playing = p.playing.load(std::memory_order_relaxed);
+        if (!playing && available >= IopAudioPlayer::kTargetFrames)
         {
-            if (!p.playing || p.buffered == 0u)
-            {
-                if (p.playing)
-                {
-                    ++p.underruns;
-                    p.playing = false;
-                }
-                out[2u * i] = out[2u * i + 1u] = 0;
-                continue;
-            }
-            out[2u * i] = p.ring[2u * p.readFrame];
-            out[2u * i + 1u] = p.ring[2u * p.readFrame + 1u];
-            p.readFrame = (p.readFrame + 1u) % IopAudioPlayer::kCapacityFrames;
-            --p.buffered;
+            playing = true;
+            p.averageFill = static_cast<double>(available);
         }
+
+        uint64_t taken = 0;
+        if (playing)
+        {
+            taken = std::min<uint64_t>(available, frames);
+            for (uint64_t i = 0; i < taken; ++i)
+            {
+                const uint64_t slot = (read + i) & (IopAudioPlayer::kCapacityFrames - 1u);
+                out[2u * i] = p.ring[2u * slot];
+                out[2u * i + 1u] = p.ring[2u * slot + 1u];
+            }
+            p.read.store(read + taken, std::memory_order_release);
+            if (taken < frames)
+            {
+                // The ring ran dry: play silence and wait for kTargetFrames again.
+                playing = false;
+                p.underruns.fetch_add(1u, std::memory_order_relaxed);
+                p.wUnderruns.fetch_add(1u, std::memory_order_relaxed);
+            }
+        }
+        if (taken < frames)
+        {
+            std::memset(out + 2u * taken, 0, static_cast<size_t>(frames - taken) * 2u * sizeof(int16_t));
+            p.wSilent.fetch_add(frames - taken, std::memory_order_relaxed);
+        }
+        p.noteFill(available - taken);
+
+        // Pacing: a ring fuller than the target slows the guest down, an emptier one speeds it up, by at most 0.5%.
+        // The average spans about half a second, smoothing the one-field bursts in which the guest produces audio.
+        int32_t ppm = 0;
+        if (playing)
+        {
+            p.averageFill += (static_cast<double>(available) - p.averageFill) * 0.02;
+            const double error = (p.averageFill - static_cast<double>(IopAudioPlayer::kTargetFrames)) /
+                                 static_cast<double>(IopAudioPlayer::kTargetFrames);
+            ppm = static_cast<int32_t>(std::clamp(error * 10000.0, -static_cast<double>(IopAudioPlayer::kMaxPacingPpm),
+                                                  static_cast<double>(IopAudioPlayer::kMaxPacingPpm)));
+        }
+        p.pacingPpm.store(ppm, std::memory_order_relaxed);
+        p.playing.store(playing, std::memory_order_relaxed);
     }
 }
 
@@ -576,41 +643,69 @@ void PS2Runtime::playIopAudio(const int16_t *samples, size_t frames)
         SetAudioStreamCallback(p.stream, iopAudioCallback);
         PlayAudioStream(p.stream);
     }
-    std::lock_guard<std::mutex> lock(p.mutex);
-    for (size_t i = 0; i < frames; ++i)
+    const uint64_t written = p.written.load(std::memory_order_relaxed);
+    const uint64_t space = IopAudioPlayer::kCapacityFrames - (written - p.read.load(std::memory_order_acquire));
+    const uint64_t accepted = std::min<uint64_t>(space, frames);
+    for (uint64_t i = 0; i < accepted; ++i)
     {
-        if (p.buffered == IopAudioPlayer::kCapacityFrames)
-        {
-            p.readFrame = (p.readFrame + 1u) % IopAudioPlayer::kCapacityFrames;
-            --p.buffered;
-            ++p.dropped;
-        }
-        const size_t write = (p.readFrame + p.buffered) % IopAudioPlayer::kCapacityFrames;
-        p.ring[2u * write] = samples[2u * i];
-        p.ring[2u * write + 1u] = samples[2u * i + 1u];
-        ++p.buffered;
+        const uint64_t slot = (written + i) & (IopAudioPlayer::kCapacityFrames - 1u);
+        p.ring[2u * slot] = samples[2u * i];
+        p.ring[2u * slot + 1u] = samples[2u * i + 1u];
     }
-    if (p.buffered > IopAudioPlayer::kMaxFrames)
+    p.written.store(written + accepted, std::memory_order_release);
+    p.wQueued.fetch_add(frames, std::memory_order_relaxed);
+    if (accepted < frames)
     {
-        const size_t drop = p.buffered - IopAudioPlayer::kStartFrames;
-        p.readFrame = (p.readFrame + drop) % IopAudioPlayer::kCapacityFrames;
-        p.buffered -= drop;
-        p.dropped += drop;
+        p.dropped.fetch_add(frames - accepted, std::memory_order_relaxed);
+        p.wDropped.fetch_add(frames - accepted, std::memory_order_relaxed);
     }
+    p.noteFill(written + accepted - p.read.load(std::memory_order_acquire));
+}
+
+bool PS2Runtime::iopAudioPacing(int32_t &ppm, bool &catchUp) const
+{
+    IopAudioPlayer &p = iopAudioPlayer();
+    if (!m_iopAudioPlayback || !p.started)
+    {
+        ppm = 0;
+        catchUp = false;
+        return false;
+    }
+    ppm = p.pacingPpm.load(std::memory_order_relaxed);
+    // Lost time is made up only while the ring is short of its target. After an underrun the device has already
+    // played the missing time as silence, so catching up beyond the target would only add latency.
+    catchUp = p.written.load(std::memory_order_acquire) - p.read.load(std::memory_order_acquire) <
+              IopAudioPlayer::kTargetFrames;
+    return true;
+}
+
+PS2Runtime::IopAudioStats PS2Runtime::takeIopAudioStats()
+{
+    IopAudioPlayer &p = iopAudioPlayer();
+    IopAudioStats window;
+    const uint64_t fill = p.written.load(std::memory_order_acquire) - p.read.load(std::memory_order_acquire);
+    window.callbacks = p.wCallbacks.exchange(0u, std::memory_order_relaxed);
+    window.framesRequested = p.wRequested.exchange(0u, std::memory_order_relaxed);
+    window.silentFrames = p.wSilent.exchange(0u, std::memory_order_relaxed);
+    window.framesQueued = p.wQueued.exchange(0u, std::memory_order_relaxed);
+    window.droppedFrames = p.wDropped.exchange(0u, std::memory_order_relaxed);
+    window.underruns = p.wUnderruns.exchange(0u, std::memory_order_relaxed);
+    window.minBuffered = std::min(p.wMinFill.exchange(fill, std::memory_order_relaxed), fill);
+    window.maxBuffered = std::max(p.wMaxFill.exchange(fill, std::memory_order_relaxed), fill);
+    window.maxCallbackGapUs = p.wMaxGapUs.exchange(0u, std::memory_order_relaxed);
+    window.buffered = fill;
+    window.pacingPpm = p.pacingPpm.load(std::memory_order_relaxed);
+    return window;
 }
 
 uint64_t PS2Runtime::iopAudioUnderruns() const
 {
-    IopAudioPlayer &p = iopAudioPlayer();
-    std::lock_guard<std::mutex> lock(p.mutex);
-    return p.underruns;
+    return iopAudioPlayer().underruns.load(std::memory_order_relaxed);
 }
 
 uint64_t PS2Runtime::iopAudioDroppedFrames() const
 {
-    IopAudioPlayer &p = iopAudioPlayer();
-    std::lock_guard<std::mutex> lock(p.mutex);
-    return p.dropped;
+    return iopAudioPlayer().dropped.load(std::memory_order_relaxed);
 }
 
 PS2Runtime::PS2Runtime()
@@ -730,9 +825,20 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
-    auto scope = m_iopHost->enterCall(ctx, rdram);
-    request.callToken = scope.token();
-    return m_iopSubsystem->handleRpc(request);
+    const uint64_t before = m_iopSubsystem->emulatorCycles();
+    ps2x::iop::RpcResult result;
+    {
+        auto scope = m_iopHost->enterCall(ctx, rdram);
+        request.callToken = scope.token();
+        result = m_iopSubsystem->handleRpc(request);
+    }
+    // An emulated IOP module serves the call at once, on IOP time. A blocking call (mode bit 0 clear) keeps the EE
+    // waiting for that long (8 EE cycles per IOP cycle); otherwise the IOP would be serving the EE for free, and a
+    // game polling a server in a tight loop would leave no IOP time for the server's own threads.
+    const uint64_t served = m_iopSubsystem->emulatorCycles() - before;
+    if (served != 0u && (request.mode & 1u) == 0u)
+        m_eeScheduler->accountCycles(static_cast<uint32_t>(std::min<uint64_t>(served * 8u, UINT32_MAX)));
+    return result;
 }
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)

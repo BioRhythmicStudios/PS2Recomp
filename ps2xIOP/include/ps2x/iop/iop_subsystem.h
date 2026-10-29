@@ -42,6 +42,8 @@ namespace ps2x::iop
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+        // The emulated IOP's cycle counter (36.864 MHz).
+        [[nodiscard]] uint64_t emulatorCycles() const noexcept;
 
     private:
         class Impl;

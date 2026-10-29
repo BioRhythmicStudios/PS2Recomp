@@ -34,6 +34,7 @@ namespace
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+    constexpr auto kAudioCatchUp = std::chrono::milliseconds(100); // pacing debt allowed while host audio plays
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -1912,8 +1913,22 @@ void EeScheduler::processDueDeadlines()
                 // a stretch of slow frames (loading, a heavy scene) the chain would otherwise lag behind wall time
                 // and let the game run faster than the field rate until it caught up. The pacing debt is therefore
                 // at most one field; the guest-cycle schedule is unchanged.
-                const auto nextHostDeadline = std::max(scheduled.hostDeadline + m_vblankPeriod,
-                                                       std::chrono::steady_clock::now());
+                // While the IOP's audio plays on the host, the audio device's clock is the reference: the period
+                // takes the player's correction (at most 0.5%), and up to kAudioCatchUp of lost time (a host stall,
+                // a slow frame) is made up by running the next fields without waiting, so the playback ring refills
+                // instead of running dry.
+                auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(m_vblankPeriod);
+                auto debtAllowance = std::chrono::steady_clock::duration::zero();
+                int32_t ppm = 0;
+                bool catchUp = false;
+                if (m_runtime.iopAudioPacing(ppm, catchUp))
+                {
+                    period += period * ppm / 1000000;
+                    if (catchUp)
+                        debtAllowance = kAudioCatchUp;
+                }
+                const auto nextHostDeadline = std::max(scheduled.hostDeadline + period,
+                                                       std::chrono::steady_clock::now() - debtAllowance);
                 scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
                               nextHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});

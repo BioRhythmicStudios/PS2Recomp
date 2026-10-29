@@ -249,6 +249,11 @@ namespace ps2x::iop
         return m_impl->emulator.isMemoryRange(address, size);
     }
 
+    uint64_t IopSubsystem::emulatorCycles() const noexcept
+    {
+        return m_impl->emulator.cycles();
+    }
+
     DebugSnapshot IopSubsystem::debugSnapshot() const
     {
         DebugSnapshot snapshot;
@@ -257,6 +262,7 @@ namespace ps2x::iop
         snapshot.emulatorLoadedModules = m_impl->emulator.loadedModuleCount();
         snapshot.emulatorThreads = m_impl->emulator.threadCount();
         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
+        m_impl->emulator.hostTiming(snapshot.hostTiming);
         snapshot.diagnostics = m_impl->loadOutcomes;
         if (!m_impl->lastError.empty())
         {
