@@ -797,18 +797,21 @@ PS2Runtime::~PS2Runtime()
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    runHeldIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    runHeldIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    runHeldIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
@@ -825,6 +828,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    runHeldIopCycles();
     const uint64_t before = m_iopSubsystem->emulatorCycles();
     ps2x::iop::RpcResult result;
     {
@@ -843,17 +847,30 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    runHeldIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
-void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+void PS2Runtime::runIopUntilIdle() noexcept
 {
-    m_iopSubsystem->runEeCycles(eeCycles);
+    runHeldIopCycles();
+    m_iopIdleEeCycles = m_iopSubsystem->idleEeCycles();
+}
+
+// Before any other call into the IOP. That call may wake it, so the next checkpoint asks again how long it idles.
+void PS2Runtime::runHeldIopCycles() noexcept
+{
+    if (m_iopHeldEeCycles != 0u)
+        m_iopSubsystem->runEeCycles(m_iopHeldEeCycles);
+    m_iopHeldEeCycles = 0u;
+    m_iopIdleEeCycles = 0u;
 }
 
 void PS2Runtime::resetIop()
 {
+    m_iopHeldEeCycles = 0u;
+    m_iopIdleEeCycles = 0u;
     m_iopSubsystem->reset();
 }
 
@@ -864,11 +881,15 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 
 uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
 {
+    if (m_iopSubsystem)
+        runHeldIopCycles();
     return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
 }
 
 bool PS2Runtime::freeIopMemory(uint32_t address)
 {
+    if (m_iopSubsystem)
+        runHeldIopCycles();
     return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
 }
 
@@ -879,11 +900,15 @@ bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size)
 
 bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
 {
+    if (m_iopSubsystem)
+        runHeldIopCycles();
     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
 }
 
 bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
 {
+    if (m_iopSubsystem)
+        runHeldIopCycles();
     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
 }
 
@@ -1250,7 +1275,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         return false;
     }
 
-    m_iopSubsystem->reset();
+    resetIop();
 
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,

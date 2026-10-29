@@ -545,7 +545,16 @@ private:
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
-    void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    // Called for every EE checkpoint. While the IOP has nothing due, the cycles are only counted here and handed over
+    // when it has (or before any other call into the IOP), which leaves it in the same state at a fraction of the cost.
+    void advanceIopEeCycles(uint64_t eeCycles) noexcept
+    {
+        m_iopHeldEeCycles += eeCycles;
+        if (m_iopHeldEeCycles >= m_iopIdleEeCycles)
+            runIopUntilIdle();
+    }
+    void runIopUntilIdle() noexcept;
+    void runHeldIopCycles() noexcept;
     void resetIop();
 
     friend class PS2IopTransport;
@@ -560,6 +569,8 @@ private:
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    uint64_t m_iopHeldEeCycles = 0;  // EE cycles not yet handed to the IOP
+    uint64_t m_iopIdleEeCycles = 0;  // the IOP has nothing due before it is handed this many
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

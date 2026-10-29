@@ -27,6 +27,11 @@ namespace ps2x::iop
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // EE cycles that runEeCycles() can be handed (in one call or many) before the IOP has anything to do: no
+        // thread can run and no timer, DMA, callback or SPU2 sync falls due. Withholding fewer cycles than this and
+        // passing them on later leaves the IOP exactly as calling runEeCycles() each time would. Any other call into
+        // the subsystem may change it.
+        [[nodiscard]] uint64_t idleEeCycles() const noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;

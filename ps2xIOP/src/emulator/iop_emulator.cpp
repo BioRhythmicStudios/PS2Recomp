@@ -939,6 +939,25 @@ namespace ps2x::iop::detail
         }
     }
 
+    uint64_t IopEmulator::idleEeCycles() const noexcept
+    {
+        // The last IOP cycle the EE clock may reach with runEeCycles() changing nothing but the clocks: up to where
+        // the IOP already is, or up to its next event while it idles; and short of the next SPU2 sync.
+        const Impl &impl = *m_impl;
+        uint64_t last = impl.totalCycles < impl.idleUntil ? impl.idleUntil : impl.totalCycles;
+        if (impl.libsd.initialized())
+        {
+            const uint64_t syncDue = impl.spu2LastSync + kSpu2SyncCycles;
+            if (impl.totalCycles >= syncDue)
+                return 0u;
+            last = std::min(last, syncDue - 1u);
+        }
+        if (last < impl.eeClockCycles)
+            return 0u;
+        const uint64_t span = std::min<uint64_t>(last - impl.eeClockCycles, 1ull << 32); // idleUntil may be "never"
+        return (span + 1u) * 8u - impl.eeCycleCarry;
+    }
+
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
         m_impl->idleUntil = 0;

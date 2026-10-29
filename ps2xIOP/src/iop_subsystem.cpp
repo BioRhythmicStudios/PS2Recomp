@@ -249,6 +249,11 @@ namespace ps2x::iop
         return m_impl->emulator.isMemoryRange(address, size);
     }
 
+    uint64_t IopSubsystem::idleEeCycles() const noexcept
+    {
+        return m_impl->emulator.idleEeCycles();
+    }
+
     uint64_t IopSubsystem::emulatorCycles() const noexcept
     {
         return m_impl->emulator.cycles();

@@ -239,6 +239,49 @@ void register_ps2_spu2_tests()
             t.Equals(iop.emulatorCycles(), served + 1001u, "IOP cycles equal the EE's grant once it catches up");
         });
 
+        tc.Run("EE cycles withheld while the IOP idles leave it where stepping would", [](TestCase &t)
+        {
+            // The runtime hands the IOP its EE cycles only once idleEeCycles() of them have built up.
+            const uint32_t sid = 0x00012345u;
+            iop_test::Host steppedHost, heldHost;
+            ps2x::iop::IopSubsystem stepped(steppedHost), held(heldHost);
+            iop_test::rpcServer(sid, 0x1234u).install(steppedHost, 0x1000u);
+            iop_test::rpcServer(sid, 0x1234u).install(heldHost, 0x1000u);
+            t.IsTrue(stepped.loadModuleBuffer(0x1000u).moduleId > 0, "RPC server loads");
+            t.IsTrue(held.loadModuleBuffer(0x1000u).moduleId > 0, "RPC server loads twice");
+            ps2x::iop::RpcRequest request{};
+            request.sid = sid;
+            request.receive = {0x800u, 4u};
+
+            uint64_t pending = 0u, idle = 0u, skipped = 0u;
+            for (int checkpoint = 0; checkpoint < 200000; ++checkpoint)
+            {
+                const uint32_t cycles = 29u + static_cast<uint32_t>(checkpoint % 7);
+                stepped.runEeCycles(cycles);
+                pending += cycles;
+                if (pending >= idle)
+                {
+                    held.runEeCycles(pending);
+                    pending = 0u;
+                    idle = held.idleEeCycles();
+                }
+                else
+                {
+                    ++skipped;
+                }
+                if (checkpoint % 5000 == 0)
+                {
+                    held.runEeCycles(pending); // flushed before any other call
+                    pending = 0u;
+                    t.IsTrue(stepped.handleRpc(request).handled && held.handleRpc(request).handled, "the server answers");
+                    idle = 0u;
+                }
+            }
+            held.runEeCycles(pending);
+            t.IsTrue(skipped > 100000u, "most checkpoints are skipped while the server sleeps");
+            t.Equals(held.emulatorCycles(), stepped.emulatorCycles(), "same IOP time");
+        });
+
         tc.Run("IRX modules start with argc and argv", [](TestCase &t)
         {
             iop_test::Host host;
