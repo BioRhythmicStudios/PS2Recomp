@@ -919,6 +919,13 @@ namespace ps2x::iop::detail
         return m_impl->stopModule(moduleId, result);
     }
 
+    void IopEmulator::runToCycle(uint64_t iopCycle) noexcept
+    {
+        if (m_impl->eeClockCycles < iopCycle)
+            m_impl->eeClockCycles = iopCycle;
+        runEeCycles(0u);
+    }
+
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;

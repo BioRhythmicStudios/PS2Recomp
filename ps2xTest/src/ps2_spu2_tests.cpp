@@ -282,6 +282,31 @@ void register_ps2_spu2_tests()
             t.Equals(held.emulatorCycles(), stepped.emulatorCycles(), "same IOP time");
         });
 
+        tc.Run("runToCycle runs the IOP to a clock of its own, and the EE's grant continues from there", [](TestCase &t)
+        {
+            // The real-time audio clock runs the IOP up to the audio device's position instead of EE time / 8.
+            const uint32_t sid = 0x00012345u;
+            iop_test::Host host;
+            ps2x::iop::IopSubsystem iop(host);
+            iop_test::rpcServer(sid, 0x1234u).install(host, 0x1000u);
+            t.IsTrue(iop.loadModuleBuffer(0x1000u).moduleId > 0, "RPC server loads");
+            const uint64_t start = iop.emulatorCycles();
+            iop.runToCycle(start + 50000u);
+            t.Equals(iop.emulatorCycles(), start + 50000u, "the IOP reaches the requested cycle");
+            iop.runToCycle(start + 10000u);
+            t.Equals(iop.emulatorCycles(), start + 50000u, "an earlier cycle changes nothing");
+            ps2x::iop::RpcRequest request{};
+            request.sid = sid;
+            request.receive = {0x800u, 4u};
+            t.IsTrue(iop.handleRpc(request).handled, "the server answers");
+            const uint64_t served = iop.emulatorCycles();
+            t.IsTrue(served > start + 50000u, "serving takes IOP cycles");
+            iop.runToCycle(served + 1000u);
+            t.Equals(iop.emulatorCycles(), served + 1000u, "the clock continues from the served time");
+            iop.runEeCycles(8u * 500u);
+            t.Equals(iop.emulatorCycles(), served + 1500u, "EE cycles granted afterwards add on");
+        });
+
         tc.Run("IRX modules start with argc and argv", [](TestCase &t)
         {
             iop_test::Host host;

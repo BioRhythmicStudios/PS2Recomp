@@ -32,6 +32,9 @@ namespace ps2x::iop
         // passing them on later leaves the IOP exactly as calling runEeCycles() each time would. Any other call into
         // the subsystem may change it.
         [[nodiscard]] uint64_t idleEeCycles() const noexcept;
+        // Runs the IOP up to the given emulator cycle (see emulatorCycles()), for a clock that is not the EE's; a
+        // cycle the IOP has already reached changes nothing. runEeCycles() then continues from there.
+        void runToCycle(uint64_t iopCycle) noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
