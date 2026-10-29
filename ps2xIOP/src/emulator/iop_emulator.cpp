@@ -366,19 +366,28 @@ namespace ps2x::iop::detail
                     for (uint32_t v = 0; v < IopSpu2::VoicesPerCore; ++v)
                         peakBeforeKeyOn[(cpu.gpr[4] & 1u) * IopSpu2::VoicesPerCore + v] = spu2.voicePeak(cpu.gpr[4] & 1u, v);
                 (void)libsd.dispatchImport(call.ordinal, cpu, totalCycles, callback);
-                // PS2X_LIBSD_TRACE=<n>: log the first n calls of each libsd function.
+                // PS2X_LIBSD_TRACE=<n>: log the first n calls of each libsd function; with PS2X_LIBSD_TRACE_FROM=<sample>,
+                // the first n calls of any function from that SPU2 sample on.
                 static const uint64_t traceLimit = []
                 {
                     const char *value = std::getenv("PS2X_LIBSD_TRACE");
                     return value ? std::strtoull(value, nullptr, 0) : 0ull;
                 }();
-                if (traceLimit != 0u && libsd.calls(call.ordinal) <= traceLimit)
+                static const uint64_t traceFrom = []
+                {
+                    const char *value = std::getenv("PS2X_LIBSD_TRACE_FROM");
+                    return value ? std::strtoull(value, nullptr, 0) : 0ull;
+                }();
+                static uint64_t tracedFrom = 0u;
+                if (traceLimit != 0u && (traceFrom != 0u ? spu2.samplesMixed() >= traceFrom && tracedFrom++ < traceLimit
+                                                         : libsd.calls(call.ordinal) <= traceLimit))
                 {
                     std::ostringstream out;
                     out << "[IOP:libsd] #" << std::dec << call.ordinal << '(' << std::hex << "0x" << arguments[0]
                         << ", 0x" << arguments[1] << ", 0x" << arguments[2] << ", 0x" << arguments[3] << ") -> 0x"
-                        << cpu.gpr[2] << " ra=0x" << cpu.gpr[31] << " sample=" << std::dec << spu2.samplesMixed();
-                    log(LogLevel::Debug, out.str());
+                        << cpu.gpr[2] << " ra=0x" << cpu.gpr[31] << " sample=" << std::dec << spu2.samplesMixed()
+                        << " cycle=" << totalCycles;
+                    log(traceFrom != 0u ? LogLevel::Info : LogLevel::Debug, out.str());
                 }
                 // PS2X_SPU2_KON_TRACE=<n>: describe the first n voices keyed on (sceSdSetSwitch KON), and the first n
                 // voice transfers.
