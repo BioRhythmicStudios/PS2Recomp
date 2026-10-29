@@ -18,10 +18,12 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -33,6 +35,7 @@ namespace
     constexpr uint32_t kPcMask = 0x3FFFu;
     constexpr size_t kMaxVariantsPerPc = 24;
     constexpr size_t kMaxNodes = 60000;
+    constexpr size_t kChunkNodes = 96; // nodes per emitted function (see emitChunks)
 
     constexpr uint8_t laneBit(uint32_t component) { return static_cast<uint8_t>(1u << (3u - component)); }
 
@@ -144,6 +147,7 @@ public:
     explicit VU1AotCompiler(std::vector<uint8_t> code) : m_code(std::move(code)), m_vu(std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1)) {}
 
     bool generate(const std::vector<uint32_t> &entries, uint64_t hash, std::ostream &out);
+    void emitChunks(const std::vector<std::pair<uint32_t, int>> &entryNodes, std::ostream &out);
 
 private:
     std::vector<uint8_t> m_code;
@@ -153,7 +157,8 @@ private:
     std::vector<int> m_work;
     std::map<uint32_t, size_t> m_variants;
     std::set<uint32_t> m_jrTargets;
-    std::ostringstream m_body;
+    std::ostringstream m_body;           // the node being simulated
+    std::vector<std::string> m_nodeText; // each node's code, by id
     std::ostringstream m_tables;
     std::map<std::string, int> m_handoverByKey;
     int m_handovers = 0;
@@ -1037,9 +1042,9 @@ void VU1AotCompiler::simulate(const Node &n)
             while (st.anyPending())
                 commitAt(st, ++u, out);
             if (dynamicPc)
-                out << "VU1AotRuntime::finish(vu, cyc + " << u << ", wclip, jt); return VU1AotResult::Completed;\n";
+                out << "VU1AotRuntime::finish(vu, cyc + " << u << ", wclip, jt); RET(VU1AotResult::Completed);\n";
             else
-                out << "VU1AotRuntime::finish(vu, cyc + " << u << ", wclip, " << hex(nextPc) << "u); return VU1AotResult::Completed;\n";
+                out << "VU1AotRuntime::finish(vu, cyc + " << u << ", wclip, " << hex(nextPc) << "u); RET(VU1AotResult::Completed);\n";
             return;
         }
         shift(st, used);
@@ -1073,6 +1078,168 @@ void VU1AotCompiler::simulate(const Node &n)
         successor(s, false, o);
 }
 
+// Code layout. A single function holding every node is far beyond the size MSVC optimises: it silently compiles such
+// a function without optimisation (every value lives in memory, every helper is a call). The nodes are therefore
+// grouped into chunk functions of at most kChunkNodes nodes, keeping each loop (strongly connected component of the
+// goto graph) in one chunk where it fits. A goto inside a chunk stays a goto; a goto to another chunk saves the values
+// that live across nodes (cyc, wclip, bk, jt; P and L stay in the shared context) and returns the target node to run's
+// dispatch loop. Node bodies are unchanged, so the computation and its order are those of the single-function form.
+void VU1AotCompiler::emitChunks(const std::vector<std::pair<uint32_t, int>> &entryNodes, std::ostream &out)
+{
+    size_t chunkNodes = kChunkNodes;
+    if (const char *v = std::getenv("PS2X_VU1AOT_CHUNK_NODES")) // layout experiments only
+        chunkNodes = std::max<size_t>(1, std::strtoul(v, nullptr, 10));
+    const int count = static_cast<int>(m_nodes.size());
+    const std::regex gotoRe("goto N([0-9]+);");
+
+    std::vector<std::vector<int>> succ(count);
+    for (int id = 0; id < count; ++id)
+        for (std::sregex_iterator it(m_nodeText[id].begin(), m_nodeText[id].end(), gotoRe), e; it != e; ++it)
+            succ[id].push_back(std::stoi((*it)[1].str()));
+
+    // Tarjan's strongly connected components, iterative.
+    std::vector<int> index(count, -1), low(count, 0), stack;
+    std::vector<bool> onStack(count, false);
+    std::vector<std::vector<int>> comps;
+    int next = 0;
+    for (int root = 0; root < count; ++root)
+    {
+        if (index[root] >= 0) continue;
+        std::vector<std::pair<int, size_t>> call{{root, 0}};
+        index[root] = low[root] = next++;
+        stack.push_back(root);
+        onStack[root] = true;
+        while (!call.empty())
+        {
+            const int v = call.back().first;
+            if (call.back().second < succ[v].size())
+            {
+                const int w = succ[v][call.back().second++];
+                if (index[w] < 0)
+                {
+                    index[w] = low[w] = next++;
+                    stack.push_back(w);
+                    onStack[w] = true;
+                    call.push_back({w, 0});
+                }
+                else if (onStack[w])
+                    low[v] = std::min(low[v], index[w]);
+                continue;
+            }
+            if (low[v] == index[v])
+            {
+                std::vector<int> c;
+                int w;
+                do
+                {
+                    w = stack.back();
+                    stack.pop_back();
+                    onStack[w] = false;
+                    c.push_back(w);
+                } while (w != v);
+                std::sort(c.begin(), c.end());
+                comps.push_back(std::move(c));
+            }
+            call.pop_back();
+            if (!call.empty())
+                low[call.back().first] = std::min(low[call.back().first], low[v]);
+        }
+    }
+
+    // Pack components in order of their first node; split a component only when it alone exceeds the limit.
+    std::sort(comps.begin(), comps.end(), [](const auto &a, const auto &b) { return a.front() < b.front(); });
+    std::vector<std::vector<int>> chunks(1);
+    for (const auto &c : comps)
+    {
+        if (!chunks.back().empty() && chunks.back().size() + c.size() > chunkNodes)
+            chunks.emplace_back();
+        for (int id : c)
+        {
+            if (chunks.back().size() >= chunkNodes)
+                chunks.emplace_back();
+            chunks.back().push_back(id);
+        }
+    }
+    std::vector<int> chunkOf(count, -1);
+    for (size_t k = 0; k < chunks.size(); ++k)
+        for (int id : chunks[k]) chunkOf[id] = static_cast<int>(k);
+
+    // Nodes entered from outside their chunk: entry points, resume points and cross-chunk goto targets.
+    std::vector<bool> external(count, false), resumable(count, false);
+    for (const auto &[pc, id] : entryNodes)
+        if (id >= 0) external[id] = true;
+    for (int id : m_suspendNodes) external[id] = resumable[id] = true;
+    for (int id = 0; id < count; ++id)
+        for (int w : succ[id])
+            if (chunkOf[w] != chunkOf[id]) external[w] = true;
+
+    out << "struct Ctx\n{\n"
+        << "VU1Interpreter &vu; VU1State &s; uint8_t *const data; const uint64_t budgetEnd;\n"
+        << "uint64_t cyc; uint32_t wclip; int32_t bk = 0; uint32_t jt = 0;\n"
+        << "VU1AotPending P; VU1AotLive L; VU1AotResult result = VU1AotResult::Completed;\n};\n\n"
+        << "#define RET(R) do { c.result = (R); return -1; } while (0)\n"
+        << "#define HO(H, T, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
+           "RET(VU1AotRuntime::handover(vu, H, cyc + (T), P, L)); } while (0)\n"
+        << "#define SUS(H, NODE, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
+           "RET(VU1AotRuntime::suspend(vu, H, cyc, P, L, NODE)); } while (0)\n"
+        << "#define LEAVE(NODE) do { c.cyc = cyc; c.wclip = wclip; c.bk = bk; c.jt = jt; return (NODE); } while (0)\n\n";
+    for (size_t k = 0; k < chunks.size(); ++k)
+    {
+        out << "int chunk" << k << "(Ctx &c, int node)\n{\n"
+            << "VU1Interpreter &vu = c.vu; VU1State &s = c.s; uint8_t *const data = c.data; "
+               "const uint64_t budgetEnd = c.budgetEnd;\n"
+            << "uint64_t cyc = c.cyc; uint32_t wclip = c.wclip; int32_t bk = c.bk; uint32_t jt = c.jt; bool cond = false;\n"
+            << "float u_[4]; float dummy_[4]; int32_t dummyVi_ = 0;\n"
+            << "VU1AotPending &P = c.P; VU1AotLive &L = c.L;\n"
+            << "(void)vu; (void)dummy_; (void)dummyVi_; (void)cond; (void)data; (void)budgetEnd;\n"
+            << "switch (node) {\n";
+        for (int id : chunks[k])
+            if (external[id]) out << "case " << id << ": goto N" << id << ";\n";
+        out << "default: std::abort();\n}\n";
+        for (int id : chunks[k])
+        {
+            const std::string &text = m_nodeText[id];
+            size_t last = 0;
+            for (std::sregex_iterator it(text.begin(), text.end(), gotoRe), e; it != e; ++it)
+            {
+                const int w = std::stoi((*it)[1].str());
+                out << text.substr(last, static_cast<size_t>(it->position()) - last);
+                if (chunkOf[w] == static_cast<int>(k))
+                    out << it->str();
+                else
+                    out << "LEAVE(" << w << ");";
+                last = static_cast<size_t>(it->position() + it->length());
+            }
+            out << text.substr(last);
+        }
+        out << "}\n\n";
+    }
+    out << "using Chunk = int (*)(Ctx &, int);\nconst Chunk kChunks[] = {";
+    for (size_t k = 0; k < chunks.size(); ++k)
+        out << (k % 16 == 0 ? "\n" : " ") << "&chunk" << k << ",";
+    out << "\n};\nconst uint16_t kChunkOf[] = {";
+    for (int id = 0; id < count; ++id)
+        out << (id % 32 == 0 ? "\n" : " ") << chunkOf[id] << ",";
+    out << "\n};\nconst bool kResumable[] = {";
+    for (int id = 0; id < count; ++id)
+        out << (id % 32 == 0 ? "\n" : " ") << (resumable[id] ? 1 : 0) << ",";
+    out << "\n};\n\n"
+        << "VU1AotResult run(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
+        << "Ctx c{vu, VU1AotRuntime::state(vu), VU1AotRuntime::data(vu), budgetEnd, VU1AotRuntime::cycle(vu), "
+           "VU1AotRuntime::workingClip(vu)};\n"
+        << "int node = VU1AotRuntime::resumeNode(vu, c.P, c.bk, c.jt, c.wclip);\n"
+        << "if (node >= 0) { if (node >= " << count << " || !kResumable[node]) std::abort(); }\n"
+        << "else switch (c.s.pc) {\n";
+    for (const auto &[pc, id] : entryNodes)
+        if (id >= 0) out << "case " << hex(pc) << "u: node = " << id << "; break;\n";
+    out << "default: return VU1AotResult::NotCompiled;\n}\n"
+        << "while (node >= 0) node = kChunks[kChunkOf[node]](c, node);\n"
+        << "return c.result;\n}\n"
+        << "#undef RET\n#undef HO\n#undef SUS\n#undef LEAVE\n";
+    std::fprintf(stderr, "ps2x_vu1aot: %d nodes in %zu chunks of at most %zu nodes, %zu loop components\n", count,
+                 chunks.size(), chunkNodes, comps.size());
+}
+
 bool VU1AotCompiler::generate(const std::vector<uint32_t> &entries, uint64_t hash, std::ostream &out)
 {
     // JR/JALR targets: return addresses of every BAL/JALR, plus the entry points.
@@ -1092,7 +1259,12 @@ bool VU1AotCompiler::generate(const std::vector<uint32_t> &entries, uint64_t has
     {
         const int id = m_work.back();
         m_work.pop_back();
+        m_body.str("");
+        m_body.clear();
         simulate(m_nodes[id]);
+        if (m_nodeText.size() <= static_cast<size_t>(id))
+            m_nodeText.resize(id + 1);
+        m_nodeText[id] = m_body.str();
     }
 
     char name[64];
@@ -1103,31 +1275,9 @@ bool VU1AotCompiler::generate(const std::vector<uint32_t> &entries, uint64_t has
         << "#include \"runtime/ps2_vu1_aot.h\"\n\n#pragma warning(disable: 4102 4700 4701 4189)\n\n"
         << "namespace {\n"
         << m_tables.str()
-        << "\n#define HO(H, T, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
-           "return VU1AotRuntime::handover(vu, H, cyc + (T), P, L); } while (0)\n"
-        << "#define SUS(H, NODE, PCV) do { L.pc = (PCV); L.branchTarget = jt; L.viBackupValue = bk; L.workingClip = wclip; "
-           "return VU1AotRuntime::suspend(vu, H, cyc, P, L, NODE); } while (0)\n\n"
-        << "VU1AotResult run(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
-        << "VU1State &s = VU1AotRuntime::state(vu);\n"
-        << "uint8_t *const data = VU1AotRuntime::data(vu);\n"
-        << "uint64_t cyc = VU1AotRuntime::cycle(vu);\n"
-        << "uint32_t wclip = VU1AotRuntime::workingClip(vu);\n"
-        << "int32_t bk = 0; uint32_t jt = 0; bool cond = false;\n"
-        << "float u_[4]; float dummy_[4]; int32_t dummyVi_ = 0;\n"
-        << "VU1AotPending P; VU1AotLive L;\n"
-        << "(void)dummy_; (void)dummyVi_; (void)cond; (void)data;\n"
-        << "switch (VU1AotRuntime::resumeNode(vu, P, bk, jt, wclip)) {\n"
-        << "case -1: break;\n";
-    std::sort(m_suspendNodes.begin(), m_suspendNodes.end());
-    for (int id : m_suspendNodes)
-        out << "case " << id << ": goto N" << id << ";\n";
-    out << "default: std::abort();\n}\n"
-        << "switch (s.pc) {\n";
-    for (const auto &[pc, id] : entryNodes)
-        if (id >= 0) out << "case " << hex(pc) << "u: goto N" << id << ";\n";
-    out << "default: return VU1AotResult::NotCompiled;\n}\n";
-    out << m_body.str();
-    out << "}\n#undef HO\n#undef SUS\n}\n\nextern const VU1AotImage vu1aot_image_" << name << " = {0x" << name << "ull, &run};\n";
+        << "\n";
+    emitChunks(entryNodes, out);
+    out << "}\n\nextern const VU1AotImage vu1aot_image_" << name << " = {0x" << name << "ull, &run};\n";
     std::fprintf(stderr, "ps2x_vu1aot %s: %zu nodes, %d handover descriptors, %zu variant-limit exits\n", name,
                  m_nodes.size(), m_handovers, m_variantOverflows);
     return true;
