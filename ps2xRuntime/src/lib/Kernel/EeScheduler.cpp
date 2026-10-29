@@ -1,5 +1,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_pacing_trace.h"
+#include "runtime/ps2_present_pacing.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -1915,6 +1917,7 @@ void EeScheduler::processDueDeadlines()
 
         for (ScheduledEvent &scheduled : due)
         {
+            std::chrono::steady_clock::time_point nextVBlankDeadline{};
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
@@ -1940,11 +1943,21 @@ void EeScheduler::processDueDeadlines()
                 }
                 const auto nextHostDeadline = std::max(scheduled.hostDeadline + period,
                                                        std::chrono::steady_clock::now() - debtAllowance);
+                if (ps2_pacing_trace::enabled())
+                {
+                    const auto late = std::chrono::steady_clock::now() - scheduled.hostDeadline;
+                    ps2_pacing_trace::note(ps2_pacing_trace::kVBlank, static_cast<uint32_t>(m_vsyncTick),
+                                           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(late).count()));
+                    ps2_pacing_trace::note(ps2_pacing_trace::kPacing, static_cast<uint32_t>(ppm));
+                }
+                nextVBlankDeadline = nextHostDeadline;
                 scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
                               nextHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
+            if (scheduled.event.type == EeEventType::VBlankStart)
+                ps2_present_pacing::notifyVBlank(nextVBlankDeadline); // after the VSync tick advanced
         }
     }
 }

@@ -8,6 +8,8 @@
 #include "runtime/gs/gs_async_queue.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_pacing_trace.h"
+#include "runtime/ps2_present_pacing.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -2840,6 +2842,7 @@ void PS2Runtime::runHeadless()
     {
         gameThread.join();
     }
+    ps2_pacing_trace::write();
 }
 
 void PS2Runtime::run()
@@ -2864,6 +2867,17 @@ void PS2Runtime::run()
     {
         runHeadless();
         return;
+    }
+
+    // PS2X_PRESENT_PACING=vblank|deadline: see runtime/ps2_present_pacing.h.
+    const char *pacingEnv = std::getenv("PS2X_PRESENT_PACING");
+    const bool deadlinePaced = pacingEnv && std::strcmp(pacingEnv, "deadline") == 0;
+    const bool vblankPaced = deadlinePaced || (pacingEnv && std::strcmp(pacingEnv, "vblank") == 0);
+    if (vblankPaced)
+    {
+        ps2_present_pacing::enable();
+        SetTargetFPS(0); // the guest's VBlanks pace the window
+        RUNTIME_LOG("[run] presentation paced by guest VBlanks (PS2X_PRESENT_PACING=" << pacingEnv << ")");
     }
 
     // A blank image to use as a framebuffer
@@ -2933,6 +2947,8 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    uint64_t presentedVBlank = 0;
+    int64_t presentedDeadlineNs = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2967,6 +2983,29 @@ void PS2Runtime::run()
 
             }
         });
+        if (deadlinePaced)
+        {
+            // One present per guest VBlank, at its host deadline. Once the deadline just presented has passed, wait
+            // for the scheduler to process that VBlank and announce the next one. The timeouts keep the window
+            // responsive while the guest produces no VBlanks (a long load or a stall).
+            int64_t next = ps2_present_pacing::state().nextDeadlineNs.load(std::memory_order_acquire);
+            while (next == presentedDeadlineNs &&
+                   ps2_present_pacing::waitVBlank(presentedVBlank, std::chrono::milliseconds(100)))
+                next = ps2_present_pacing::state().nextDeadlineNs.load(std::memory_order_acquire);
+            if (next != presentedDeadlineNs)
+            {
+                const int64_t limit = ps2_present_pacing::toNs(std::chrono::steady_clock::now()) + 100000000;
+                ps2_present_pacing::sleepUntilNs(std::min(next, limit));
+                presentedDeadlineNs = next;
+            }
+        }
+        else if (vblankPaced)
+        {
+            // One present per guest VBlank. The frame the guest finished before this VBlank is already published,
+            // since both happen on the game thread in that order. The timeout keeps the window responsive while the
+            // guest produces no VBlanks (a long load or a stall).
+            ps2_present_pacing::waitVBlank(presentedVBlank, std::chrono::milliseconds(100));
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         {
@@ -3017,6 +3056,7 @@ void PS2Runtime::run()
             }
         }
         EndDrawing();
+        ps2_pacing_trace::note(ps2_pacing_trace::kSwap);
 
         if (WindowShouldClose())
         {
@@ -3031,6 +3071,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    ps2_pacing_trace::write();
     if (gsQueue)
     {
         m_gifArbiter.setTakePacketFn(nullptr);
