@@ -101,6 +101,26 @@ void register_ps2_spu2_tests()
             t.Equals(static_cast<int>(slow.phase), 1, "a slow attack is still rising");
         });
 
+        tc.Run("ADSR decay and release fields are shifts, not rates", [](TestCase &t)
+        {
+            // Maximo's Graveyard loop (effect 0x1C4) uses ADSR2 0x1FCF: linear release shift 15, which steps -8 every
+            // 1 << (15 - 11) = 16 samples, so full level is gone in 0x7FFF / 8 * 16 = 65,536 samples (1.37 s).
+            IopSpu2::Envelope release{0x7FFF, 0, 4};
+            int samples = 0;
+            for (; samples < 70000 && release.phase != 0u; ++samples)
+                IopSpu2::tickAdsr(release, 0x39FFu, 0x1FCFu);
+            t.Equals(static_cast<int>(release.phase), 0, "a linear release of shift 15 ends");
+            t.IsTrue(samples > 65000 && samples <= 65536, "it takes 16 samples per step of 8");
+
+            // Decay shift 8 (ADSR1 0x0080, sustain level 0x800): exponential steps of -8 * level / 0x8000 every sample.
+            IopSpu2::Envelope decay{0x7FFF, 0, 2};
+            samples = 0;
+            for (; samples < 20000 && decay.phase == 2u; ++samples)
+                IopSpu2::tickAdsr(decay, 0x0080u, 0u);
+            t.Equals(static_cast<int>(decay.phase), 3, "a decay of shift 8 reaches the sustain level");
+            t.IsTrue(samples < 20000, "within a few thousand samples");
+        });
+
         tc.Run("interpolation taps sum to unity gain", [](TestCase &t)
         {
             const auto &table = IopSpu2::interpolationTable();

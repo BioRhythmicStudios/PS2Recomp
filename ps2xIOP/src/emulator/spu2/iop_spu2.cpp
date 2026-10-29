@@ -158,8 +158,8 @@ namespace ps2x::iop::detail
             exponential = (adsr1 & 0x8000u) != 0u;
             break;
         }
-        case 2: // decay
-            shift = ((adsr1 >> 4u) & 0xFu) << 2u;
+        case 2: // decay: bits 7-4 are the shift itself (the rate is shift*4, with step -8)
+            shift = (adsr1 >> 4u) & 0xFu;
             step = -8;
             exponential = true;
             decrease = true;
@@ -173,8 +173,8 @@ namespace ps2x::iop::detail
             exponential = (adsr2 & 0x8000u) != 0u;
             break;
         }
-        case 4: // release
-            shift = (adsr2 & 0x1Fu) << 2u;
+        case 4: // release: bits 4-0 are the shift itself (the rate is shift*4, with step -8)
+            shift = adsr2 & 0x1Fu;
             step = -8;
             exponential = (adsr2 & 0x20u) != 0u;
             decrease = true;
