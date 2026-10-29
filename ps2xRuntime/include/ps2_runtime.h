@@ -484,6 +484,20 @@ public:
     // Plays the emulated IOP's SPU2 output on the host audio device (windowed runs: the device opens with the
     // window). The output is buffered about 60 ms behind the guest.
     void setIopAudioPlayback(bool enabled) { m_iopAudioPlayback = enabled; }
+    // What times the IOP while its audio plays on the host.
+    // - Lockstep (the default): EE time / 8, exactly as without playback. The audio device paces the EE instead
+    //   (iopAudioPacing), so a guest that falls behind real time runs its audio dry.
+    // - RealTime: the audio device's clock. The IOP runs, all threads and timers included, up to where the device has
+    //   played plus the playback ring's target, so it keeps up when the EE is slow and never runs ahead of the device.
+    //   The EE keeps its own field-rate pacing. While the device is not consuming (not started, or stalled for longer
+    //   than 200 ms), the IOP falls back to EE time.
+    enum class IopAudioClock
+    {
+        Lockstep,
+        RealTime
+    };
+    void setIopAudioClock(IopAudioClock clock) { m_iopAudioClock = clock; }
+    [[nodiscard]] IopAudioClock iopAudioClock() const { return m_iopAudioClock; }
     void playIopAudio(const int16_t *samples, size_t frames);
     // Host playback counters since the previous call (frames are 48 kHz stereo frames).
     struct IopAudioStats
@@ -499,6 +513,10 @@ public:
         uint64_t buffered = 0;
         uint64_t maxCallbackGapUs = 0;
         int32_t pacingPpm = 0;
+        bool realTime = false;            // the IOP followed the device clock at the end of the window
+        uint64_t realTimeTicks = 0;       // device-clock IOP updates
+        uint64_t realTimeFallbacks = 0;   // updates that fell back to EE time (device not consuming)
+        uint64_t realTimeAnchors = 0;     // times the IOP clock was (re)attached to the device clock
     };
     IopAudioStats takeIopAudioStats();
     // While host playback runs: true, with the VBlank pacing correction (parts per million of the period; positive
@@ -549,12 +567,24 @@ private:
     // when it has (or before any other call into the IOP), which leaves it in the same state at a fraction of the cost.
     void advanceIopEeCycles(uint64_t eeCycles) noexcept
     {
+        if (m_iopAudioClock == IopAudioClock::RealTime && m_iopAudioPlayback)
+        {
+            m_iopRealTimeEeCycles += eeCycles;
+            if (m_iopRealTimeEeCycles >= kIopRealTimeTickEeCycles)
+                runIopRealTime();
+            return;
+        }
         m_iopHeldEeCycles += eeCycles;
         if (m_iopHeldEeCycles >= m_iopIdleEeCycles)
             runIopUntilIdle();
     }
     void runIopUntilIdle() noexcept;
     void runHeldIopCycles() noexcept;
+    // RealTime clock: brings the IOP up to the audio device (or, while the device is not consuming, hands it the EE
+    // cycles since the previous update).
+    void runIopRealTime() noexcept;
+    // One update per 64 SPU2 samples of EE time (1.3 ms at full speed), the SPU2's own sync granularity.
+    static constexpr uint64_t kIopRealTimeTickEeCycles = 64u * 768u * 8u;
     void resetIop();
 
     friend class PS2IopTransport;
@@ -571,6 +601,11 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     uint64_t m_iopHeldEeCycles = 0;  // EE cycles not yet handed to the IOP
     uint64_t m_iopIdleEeCycles = 0;  // the IOP has nothing due before it is handed this many
+    IopAudioClock m_iopAudioClock = IopAudioClock::Lockstep;
+    uint64_t m_iopRealTimeEeCycles = 0;   // EE cycles since the last RealTime update
+    bool m_iopRealTimeAnchored = false;   // the anchor below is valid
+    uint64_t m_iopRealTimeAnchorCycle = 0; // IOP cycle at which the ring had been handed m_iopRealTimeAnchorFrame frames
+    uint64_t m_iopRealTimeAnchorFrame = 0;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

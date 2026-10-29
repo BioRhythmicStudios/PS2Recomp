@@ -527,6 +527,7 @@ namespace
         std::atomic<uint64_t> read{0};    // frames, monotonic; advanced only by the consumer
         std::atomic<bool> playing{false};
         std::atomic<int32_t> pacingPpm{0};
+        std::atomic<int64_t> lastCallbackNs{0}; // steady_clock time of the latest device callback
         bool started = false;
         AudioStream stream{};
 
@@ -538,6 +539,8 @@ namespace
         std::atomic<uint64_t> underruns{0}, dropped{0};
         std::atomic<uint64_t> wCallbacks{0}, wRequested{0}, wSilent{0}, wQueued{0}, wDropped{0}, wUnderruns{0};
         std::atomic<uint64_t> wMinFill{UINT64_MAX}, wMaxFill{0}, wMaxGapUs{0};
+        std::atomic<uint64_t> wRealTimeTicks{0}, wRealTimeFallbacks{0}, wRealTimeAnchors{0};
+        std::atomic<bool> realTime{false};
 
         static void atomicMin(std::atomic<uint64_t> &value, uint64_t candidate)
         {
@@ -575,6 +578,8 @@ namespace
             IopAudioPlayer::atomicMax(p.wMaxGapUs, static_cast<uint64_t>(
                                                        std::chrono::duration_cast<std::chrono::microseconds>(now - p.lastCallback).count()));
         p.lastCallback = now;
+        p.lastCallbackNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                               std::memory_order_release);
         p.wCallbacks.fetch_add(1u, std::memory_order_relaxed);
         p.wRequested.fetch_add(frames, std::memory_order_relaxed);
 
@@ -665,7 +670,8 @@ void PS2Runtime::playIopAudio(const int16_t *samples, size_t frames)
 bool PS2Runtime::iopAudioPacing(int32_t &ppm, bool &catchUp) const
 {
     IopAudioPlayer &p = iopAudioPlayer();
-    if (!m_iopAudioPlayback || !p.started)
+    // With the IOP on the device's clock the EE keeps its own field-rate pacing: the audio no longer depends on it.
+    if (!m_iopAudioPlayback || !p.started || m_iopAudioClock == IopAudioClock::RealTime)
     {
         ppm = 0;
         catchUp = false;
@@ -695,6 +701,10 @@ PS2Runtime::IopAudioStats PS2Runtime::takeIopAudioStats()
     window.maxCallbackGapUs = p.wMaxGapUs.exchange(0u, std::memory_order_relaxed);
     window.buffered = fill;
     window.pacingPpm = p.pacingPpm.load(std::memory_order_relaxed);
+    window.realTime = p.realTime.load(std::memory_order_relaxed);
+    window.realTimeTicks = p.wRealTimeTicks.exchange(0u, std::memory_order_relaxed);
+    window.realTimeFallbacks = p.wRealTimeFallbacks.exchange(0u, std::memory_order_relaxed);
+    window.realTimeAnchors = p.wRealTimeAnchors.exchange(0u, std::memory_order_relaxed);
     return window;
 }
 
@@ -861,16 +871,68 @@ void PS2Runtime::runIopUntilIdle() noexcept
 // Before any other call into the IOP. That call may wake it, so the next checkpoint asks again how long it idles.
 void PS2Runtime::runHeldIopCycles() noexcept
 {
+    if (m_iopAudioClock == IopAudioClock::RealTime && m_iopAudioPlayback)
+    {
+        runIopRealTime();
+        return;
+    }
     if (m_iopHeldEeCycles != 0u)
         m_iopSubsystem->runEeCycles(m_iopHeldEeCycles);
     m_iopHeldEeCycles = 0u;
     m_iopIdleEeCycles = 0u;
 }
 
+// The RealTime clock. The device has played `read` frames of the ring; the IOP is kept kLeadFrames ahead of that, so
+// the ring holds about kTargetFrames: the lead also covers the samples the IOP has made but not yet handed over
+// (up to one 256-frame output block plus one 64-sample sync), so that after an underrun the ring still reaches
+// kTargetFrames, where playback restarts. The target only moves as the device plays, so production can neither
+// drift from the device's rate nor overfill the ring; time the IOP could not be run (the EE thread stalled for longer
+// than the ring lasts) is not made up afterwards, so the music resumes where it stopped instead of skipping ahead.
+// Anchoring sets the target from the frames produced so far, so a ring that is fuller than the lead first drains.
+void PS2Runtime::runIopRealTime() noexcept
+{
+    constexpr uint64_t kLeadFrames = IopAudioPlayer::kTargetFrames + 384u;
+    constexpr uint64_t kIopCyclesPerFrame = 768u; // IOP cycles per 48 kHz sample
+    constexpr int64_t kStallNs = 200'000'000; // the device is taken to have stopped after 200 ms without a callback
+    const uint64_t eeCycles = m_iopRealTimeEeCycles;
+    m_iopRealTimeEeCycles = 0u;
+    IopAudioPlayer &p = iopAudioPlayer();
+    const int64_t lastCallbackNs = p.lastCallbackNs.load(std::memory_order_acquire);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    if (!p.started || lastCallbackNs == 0 || nowNs - lastCallbackNs > kStallNs)
+    {
+        if (m_iopRealTimeAnchored || p.realTime.load(std::memory_order_relaxed))
+            p.realTime.store(false, std::memory_order_relaxed);
+        m_iopRealTimeAnchored = false;
+        p.wRealTimeFallbacks.fetch_add(1u, std::memory_order_relaxed);
+        if (eeCycles != 0u)
+            m_iopSubsystem->runEeCycles(eeCycles);
+        return;
+    }
+    const uint64_t read = p.read.load(std::memory_order_acquire);
+    if (!m_iopRealTimeAnchored)
+    {
+        m_iopRealTimeAnchored = true;
+        m_iopRealTimeAnchorCycle = m_iopSubsystem->emulatorCycles();
+        m_iopRealTimeAnchorFrame = p.written.load(std::memory_order_relaxed);
+        p.realTime.store(true, std::memory_order_relaxed);
+        p.wRealTimeAnchors.fetch_add(1u, std::memory_order_relaxed);
+    }
+    p.wRealTimeTicks.fetch_add(1u, std::memory_order_relaxed);
+    if (read + kLeadFrames < m_iopRealTimeAnchorFrame)
+        return; // the ring is still draining down to the lead
+    m_iopSubsystem->runToCycle(m_iopRealTimeAnchorCycle +
+                               (read + kLeadFrames - m_iopRealTimeAnchorFrame) * kIopCyclesPerFrame);
+}
+
 void PS2Runtime::resetIop()
 {
     m_iopHeldEeCycles = 0u;
     m_iopIdleEeCycles = 0u;
+    m_iopRealTimeEeCycles = 0u;
+    m_iopRealTimeAnchored = false;
     m_iopSubsystem->reset();
 }
 
