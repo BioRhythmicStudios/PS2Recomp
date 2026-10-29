@@ -2,6 +2,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "Stubs/Pad.h"
+#include "runtime/ps2_pad.h"
 
 #include <vector>
 #include <cstdint>
@@ -68,6 +69,27 @@ void register_pad_input_tests()
 {
     MiniTest::Case("PadInput", [](TestCase &tc)
                    {
+        tc.Run("a round-gate host stick reaches the DualShock corners", [](TestCase &t)
+        {
+            uint8_t x = 0u, y = 0u;
+            ps2PadStickBytes(0.0f, 0.0f, x, y);
+            t.Equals(static_cast<int>(x), 0x80, "centred x");
+            t.Equals(static_cast<int>(y), 0x80, "centred y");
+            ps2PadStickBytes(1.0f, 0.0f, x, y);
+            t.Equals(static_cast<int>(x), 0xFF, "full right");
+            t.Equals(static_cast<int>(y), 0x80, "full right stays level");
+            ps2PadStickBytes(0.7071f, -0.7071f, x, y);
+            t.Equals(static_cast<int>(x), 0xFF, "full diagonal reaches the corner (x)");
+            t.Equals(static_cast<int>(y), 0x00, "full diagonal reaches the corner (y)");
+            ps2PadStickBytes(0.3536f, 0.3536f, x, y);
+            t.Equals(static_cast<int>(x), 0xBF, "half diagonal: larger axis = half push (x)");
+            t.Equals(static_cast<int>(y), 0xBF, "half diagonal: larger axis = half push (y)");
+            ps2PadStickBytes(0.0f, -0.71f, x, y);
+            t.Equals(static_cast<int>(y), 0x25, "a partial cardinal push is unchanged");
+            ps2PadStickBytes(0.9f, 0.9f, x, y);
+            t.Equals(static_cast<int>(x), 0xFF, "out-of-circle input clamps");
+        });
+
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);

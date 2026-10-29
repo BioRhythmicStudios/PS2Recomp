@@ -1,5 +1,7 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace
@@ -23,6 +25,21 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+}
+
+void ps2PadStickBytes(float x, float y, uint8_t &outX, uint8_t &outY)
+{
+    x = std::clamp(x, -1.0f, 1.0f);
+    y = std::clamp(y, -1.0f, 1.0f);
+    const float larger = std::max(std::fabs(x), std::fabs(y));
+    if (larger > 0.0f)
+    {
+        const float scale = std::min(std::hypot(x, y), 1.0f) / larger;
+        x = std::clamp(x * scale, -1.0f, 1.0f);
+        y = std::clamp(y * scale, -1.0f, 1.0f);
+    }
+    outX = static_cast<uint8_t>(std::lround((x + 1.0f) * 127.5f));
+    outY = static_cast<uint8_t>(std::lround((y + 1.0f) * 127.5f));
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -82,10 +99,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
         float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
         float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+        ps2PadStickBytes(lx, ly, data[6], data[7]);
+        ps2PadStickBytes(rx, ry, data[4], data[5]);
     }
     else
     {

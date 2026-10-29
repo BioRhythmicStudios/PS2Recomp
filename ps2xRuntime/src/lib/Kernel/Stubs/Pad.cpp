@@ -111,10 +111,10 @@ namespace ps2_stubs
             // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
             // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
             // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
+            ps2PadStickBytes(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X),
+                             GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y), state.lx, state.ly);
+            ps2PadStickBytes(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X),
+                             GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y), state.rx, state.ry);
 
             setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
             setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
