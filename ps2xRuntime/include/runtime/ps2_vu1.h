@@ -234,6 +234,16 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // Ready for a new kick. The 64 KB packet buffer is left as it is: a kick writes every byte before reading
+        // it, and only the bytes it wrote are submitted. (Zeroing it at every VU1 program and every XGKICK cost
+        // several percent of the game thread.)
+        void clear()
+        {
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0u;
+            issueCycle = 0u;
+            active = currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
