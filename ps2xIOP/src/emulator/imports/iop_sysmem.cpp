@@ -51,9 +51,8 @@ namespace ps2x::iop::detail
             {
                 char line[160];
                 std::snprintf(line, sizeof line,
-                              "[IOP alloc] AllocSysMemory(type %u, 0x%X bytes) -> 0x%X..0x%X [ra=0x%X] free above 0x%X",
-                              a0, a1, address, address + a1, cpu.gpr[31],
-                              IopMemory::HeapLimit - m_memory.maxFreeMemory());
+                              "[IOP alloc] AllocSysMemory(type %u, 0x%X bytes) -> 0x%X..0x%X [ra=0x%X] free 0x%X",
+                              a0, a1, address, address + a1, cpu.gpr[31], m_memory.totalFreeMemory());
                 m_host.log(LogLevel::Info, line);
             }
             return true;
@@ -75,8 +74,10 @@ namespace ps2x::iop::detail
             setV0(IopMemory::RamSize);
             return true;
         case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
+            return true;
+        case 8: // QueryTotalFreeMemSize
+            setV0(m_memory.totalFreeMemory());
             return true;
         case 9: // QueryBlockTopAddress
             if (const auto block = m_memory.allocationContaining(a0))
