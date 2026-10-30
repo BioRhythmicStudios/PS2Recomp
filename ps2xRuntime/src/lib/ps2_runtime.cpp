@@ -10,6 +10,7 @@
 #include "runtime/ps2_host_profile.h"
 #include "runtime/ps2_pacing_trace.h"
 #include "runtime/ps2_present_pacing.h"
+#include "runtime/ps2_exit_reason.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -3098,11 +3099,18 @@ void PS2Runtime::run()
 
         if (WindowShouldClose())
         {
-            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            // raylib also reports its exit key (Esc) as a close request; record which one it was.
+            const bool escape = IsKeyPressed(KEY_ESCAPE) || IsKeyDown(KEY_ESCAPE);
+            ps2_exit_reason::set(escape ? "window closed by the Esc key" : "window closed (close button or Alt+F4)");
+            RUNTIME_LOG("[run] window close requested (" << ps2_exit_reason::get() << "), breaking out of loop");
             requestStop();
             break;
         }
     }
+    if (gameThreadFinished.load(std::memory_order_acquire))
+        ps2_exit_reason::set("the game thread finished");
+    else
+        ps2_exit_reason::set("stop requested by the host");
 
     requestStop();
     if (gameThread.joinable())
