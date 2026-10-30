@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu1_overlap_model.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -393,6 +394,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             m_vif1Stalled = true;
             m_vif1StalledData.assign(data + pos, data + sizeBytes);
             queueCompletedIntcCause(5u);
+            ps2_vu1_overlap_model::noteVif1Interrupt();
             return;
         }
 
@@ -893,5 +895,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         m_vif1Stalled = true;
         m_vif1StalledData.clear();
         queueCompletedIntcCause(5u);
+        ps2_vu1_overlap_model::noteVif1Interrupt();
     }
 }

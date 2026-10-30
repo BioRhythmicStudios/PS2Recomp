@@ -2,6 +2,7 @@
 #include "runtime/ps2_ipu.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_vu1_overlap_model.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
@@ -563,9 +564,13 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     }
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVuMem);
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *ptr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (ptr)
+        ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVuMem);
+    return ptr;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -747,6 +752,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -795,6 +801,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1816,6 +1823,15 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
 
 void PS2Memory::processPendingTransfers()
 {
+    if (!m_pendingVif0Transfers.empty())
+        ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVif0);
+    for (const auto &transfer : m_pendingGifTransfers)
+        if (transfer.chainData.empty())
+            ps2_vu1_overlap_model::noteCopy(static_cast<uint64_t>(transfer.qwc) * 16u);
+    for (const auto &transfer : m_pendingVif1Transfers)
+        if (transfer.chainData.empty())
+            ps2_vu1_overlap_model::noteCopy(static_cast<uint64_t>(transfer.qwc) * 16u);
+    ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kWhole);
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2082,6 +2098,7 @@ void PS2Memory::resumeStalledVif1()
         return;
     if (vif1IrqTraceEnabled())
         std::fprintf(stderr, "[vif1-irq] STC resume, %zu bytes held\n", m_vif1StalledData.size());
+    ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kWhole);
     m_vif1Stalled = false;
     std::vector<uint8_t> rest;
     rest.swap(m_vif1StalledData);
@@ -2539,6 +2556,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (address == 0x10003020u) // GIF_STAT
     {
+        ps2_vu1_overlap_model::noteVifRegRead(address);
         uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
         const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;
@@ -2557,6 +2575,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     // not the last value the CPU stored there.
     if ((address >= 0x10003800u && address < 0x10003980u) || (address >= 0x10003C00u && address < 0x10003D80u))
     {
+        if (address >= 0x10003C00u)
+            ps2_vu1_overlap_model::noteVifRegRead(address);
         const VIFRegisters &vif = (address >= 0x10003C00u) ? vif1_regs : vif0_regs;
         const uint32_t offset = address & 0x1F0u;
         static constexpr uint32_t VIFRegisters::*kVifRegs[] = {

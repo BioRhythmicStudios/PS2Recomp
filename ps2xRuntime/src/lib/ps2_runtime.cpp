@@ -11,6 +11,7 @@
 #include "runtime/ps2_pacing_trace.h"
 #include "runtime/ps2_present_pacing.h"
 #include "runtime/ps2_exit_reason.h"
+#include "runtime/ps2_vu1_overlap_model.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -984,6 +985,7 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 
 bool PS2Runtime::syncCoreSubsystems()
 {
+    ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsStub);
     uint8_t *const rdram = m_memory.getRDRAM();
     uint8_t *const gsVram = m_memory.getGSVRAM();
     if (!rdram || !gsVram)
@@ -1012,6 +1014,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      ps2_host_profile::Scope profileScope(ps2_host_profile::kVu1);
+                                     ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kSplit);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
@@ -1031,6 +1034,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      ps2_host_profile::Scope profileScope(ps2_host_profile::kVu1);
+                                     ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kSplit);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
