@@ -320,6 +320,7 @@ public:
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
     [[nodiscard]] uint32_t invocationStackTop();
+    void releaseInvocationStacks(int threadId);
 
     int addIrqHandler(bool dmac,
                       uint32_t cause,
@@ -461,6 +462,8 @@ private:
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+    // Stacks of deleted threads, handed out again before new ones are reserved.
+    std::vector<uint32_t> m_freeInvocationStacks;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     mutable std::mutex m_snapshotMutex;
