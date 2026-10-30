@@ -4,10 +4,26 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        // PS2X_IOP_ALLOC_TRACE=1 logs every IOP heap allocation and release.
+        bool allocTraceEnabled()
+        {
+            static const bool value = []
+            {
+                const char *text = std::getenv("PS2X_IOP_ALLOC_TRACE");
+                return text && text[0] == '1';
+            }();
+            return value;
+        }
+    }
+
     IopSysmem::IopSysmem(IopHost &host, IopMemory &memory) noexcept
         : m_host(host), m_memory(memory)
     {
@@ -31,11 +47,30 @@ namespace ps2x::iop::detail
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
             setV0(address);
+            if (allocTraceEnabled())
+            {
+                char line[160];
+                std::snprintf(line, sizeof line,
+                              "[IOP alloc] AllocSysMemory(type %u, 0x%X bytes) -> 0x%X..0x%X [ra=0x%X] free above 0x%X",
+                              a0, a1, address, address + a1, cpu.gpr[31],
+                              IopMemory::HeapLimit - m_memory.maxFreeMemory());
+                m_host.log(LogLevel::Info, line);
+            }
             return true;
         }
         case 5: // FreeSysMemory
-            setV0(m_memory.freeAllocation(a0) ? 0u : 0xFFFFFFFFu);
+        {
+            const bool freed = m_memory.freeAllocation(a0);
+            setV0(freed ? 0u : 0xFFFFFFFFu);
+            if (allocTraceEnabled())
+            {
+                char line[96];
+                std::snprintf(line, sizeof line, "[IOP alloc] FreeSysMemory(0x%X) -> %d [ra=0x%X]", a0, freed ? 0 : -1,
+                              cpu.gpr[31]);
+                m_host.log(LogLevel::Info, line);
+            }
             return true;
+        }
         case 6: // QueryMemSize
             setV0(IopMemory::RamSize);
             return true;
