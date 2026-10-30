@@ -367,7 +367,10 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    // Marks the snapshot stale. The run loop republishes it every kDebugPublishDispatchInterval dispatches, before
+    // an idle wait and when it stops: building it on every kernel call cost the FMV player about a tenth of its time.
     void publishSnapshot();
+    void publishSnapshotNow();
 
 private:
     struct ScheduledEvent
@@ -466,4 +469,5 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    bool m_snapshotStale = false;
 };

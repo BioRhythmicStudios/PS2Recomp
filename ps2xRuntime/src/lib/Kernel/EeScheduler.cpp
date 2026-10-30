@@ -169,7 +169,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
                   std::chrono::steady_clock::now() + m_vblankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
-    publishSnapshot();
+    publishSnapshotNow();
 }
 
 void EeScheduler::run()
@@ -192,7 +192,10 @@ void EeScheduler::run()
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
-                publishSnapshot();
+                if (m_snapshotStale)
+                {
+                    publishSnapshotNow();
+                }
                 waitForEvent();
                 continue;
             }
@@ -238,7 +241,7 @@ void EeScheduler::run()
         if (m_debugPublishCountdown == 0u)
         {
             copyMainContextToRuntime();
-            publishSnapshot();
+            publishSnapshotNow();
             m_debugPublishCountdown = kDebugPublishDispatchInterval - 1u;
         }
         else
@@ -329,7 +332,7 @@ void EeScheduler::run()
         {
             m_guestExecuting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
-            publishSnapshot();
+            publishSnapshotNow();
             throw;
         }
 
@@ -348,7 +351,7 @@ void EeScheduler::run()
     m_guestExecuting.store(false, std::memory_order_release);
     m_running.store(false, std::memory_order_release);
     copyMainContextToRuntime();
-    publishSnapshot();
+    publishSnapshotNow();
 }
 
 void EeScheduler::requestStop()
@@ -789,7 +792,13 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
     }
 
     GuestThread *self = currentThread();
-    if (self && self->currentPriority == priority)
+    if (self && self->currentPriority == priority && !hasReadyAtOrAbovePriority(priority))
+    {
+        // Nothing else is ready at this priority or above, so the rotation would select the caller again: it keeps
+        // running without the dispatcher transfer (an exception unwind). Only the fresh time slice remains.
+        renewTimeSlice();
+    }
+    else if (self && self->currentPriority == priority)
     {
         enqueueReady(*self);
         m_currentThreadId = 0;
@@ -1545,6 +1554,12 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
+    m_snapshotStale = true;
+}
+
+void EeScheduler::publishSnapshotNow()
+{
+    m_snapshotStale = false;
     EeKernelSnapshot next{};
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;

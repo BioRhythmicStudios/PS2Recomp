@@ -116,15 +116,10 @@ uint32_t Ps2Ipu::bufferedInputQwords() const { return m_bits->qwords(); }
 
 void Ps2Ipu::setTopFromInput()
 {
-    try
-    {
+    // Polled by the MPEG library while the input is short, so this checks rather than catching IpuStarved.
+    m_topValid = m_bits->tryEnsure(32);
+    if (m_topValid)
         m_top = m_bits->peek(32);
-        m_topValid = true;
-    }
-    catch (const ps2_ipu::IpuStarved &)
-    {
-        m_topValid = false;
-    }
 }
 
 uint32_t Ps2Ipu::readRegister32(uint32_t address)
@@ -767,14 +762,8 @@ bool Ps2Ipu::stepBdec()
     }
     pushOutput(reinterpret_cast<const uint8_t *>(mb), sizeof(mb));
     ++m_stats.macroblocks;
-    try
-    {
-        if (bits.peek(23) == 0u)
-            m_ctrl |= kCtrlScd;
-    }
-    catch (const ps2_ipu::IpuStarved &)
-    {
-    }
+    if (bits.tryEnsure(23) && bits.peek(23) == 0u)
+        m_ctrl |= kCtrlScd;
     m_awaitingDrain = true;
     return true;
 }
