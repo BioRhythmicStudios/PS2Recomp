@@ -16,6 +16,7 @@ namespace ps2_host_profile
         kGs,
         kPresent, // latching and converting the displayed frame (main thread, or the GS worker when asynchronous)
         kGsWait,  // game thread blocked on the GS worker (queue full, or a synchronous GS entry point)
+        kVu1Wait, // game thread blocked on the VU1 back-end worker (PS2X_VU1_THREAD=1)
         kCategoryCount
     };
 
