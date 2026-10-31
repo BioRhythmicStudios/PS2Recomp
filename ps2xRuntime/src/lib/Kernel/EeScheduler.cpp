@@ -2,6 +2,7 @@
 #include "runtime/ps2_host_profile.h"
 #include "runtime/ps2_pacing_trace.h"
 #include "runtime/ps2_present_pacing.h"
+#include "runtime/ps2_vu1_overlap_model.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -1383,6 +1384,7 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
 
 [[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion)
 {
+    ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVSync);
     blockCurrent(EeWaitState{
         EeWaitReason::VSync,
         EeVSyncWait{afterTick, fixedResult},

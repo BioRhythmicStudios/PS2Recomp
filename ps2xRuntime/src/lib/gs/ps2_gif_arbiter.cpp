@@ -1,4 +1,5 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "runtime/ps2_vu1_overlap_model.h"
 #include <algorithm>
 #include <cstring>
 
@@ -37,6 +38,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
 
 void GifArbiter::drain()
 {
+    ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kSplit);
     if (!m_processFn && !m_pathFn)
         return;
 

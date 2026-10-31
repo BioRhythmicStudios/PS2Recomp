@@ -560,6 +560,9 @@ private:
     void coalesceGuestHeapLocked();
     void HandleIntegerOverflow(R5900Context *ctx);
     void runHeadless();
+    // PS2X_VU1_THREAD=1: VU1 and the GIF/GS back end on a worker thread for this run (ps2_vu1_thread.h).
+    void startVu1ThreadIfRequested(bool gsWorker);
+    void stopVu1Thread();
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
