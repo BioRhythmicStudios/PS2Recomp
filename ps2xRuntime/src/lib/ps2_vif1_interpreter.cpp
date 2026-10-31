@@ -368,6 +368,215 @@ bool vif1IrqTraceEnabled()
     return enabled;
 }
 
+namespace
+{
+    // UNPACK's vector loop. Kept out of the parser, and given the registers as values, so that its code does not
+    // depend on the large function around it (VU1 memory writes through a member pointer otherwise force reloads
+    // of the registers on every vector). Difference mode (STMOD 2) updates row.
+    void vif1UnpackVectors(uint8_t *vu1Data, const uint8_t *srcBase, uint32_t writeVectorCount, uint32_t sourceVectorCount,
+                           uint32_t bytesPerVector, uint32_t cl, uint32_t wl, uint32_t vuAddr, uint8_t vn, uint8_t vl,
+                           int components, bool maskEnable, bool zeroExtend, bool readVuMem, bool writeVuMem,
+                           uint32_t regMode, uint32_t maskBits, uint32_t row[4], const uint32_t col[4])
+    {
+        const uint32_t mode = regMode & 3u;
+        uint32_t srcIndex = 0u;
+        for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+        {
+            const uint32_t cyclePos = writeIndex % wl;
+            const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
+
+            uint32_t destVec = 0;
+            if (cl >= wl)
+            {
+                destVec = (vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu;
+            }
+            else
+            {
+                destVec = (vuAddr + writeIndex) & 0x3FFu;
+            }
+
+            uint32_t destOff = destVec * 16u;
+            if (destOff + 16u > PS2_VU1_DATA_SIZE)
+            {
+                if (sourceAvailable && srcIndex < sourceVectorCount)
+                    ++srcIndex;
+                continue;
+            }
+
+            uint32_t lanes[4] = {0u, 0u, 0u, 0u};
+            if (readVuMem)
+                std::memcpy(lanes, vu1Data + destOff, sizeof(lanes));
+            uint32_t decompressed[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
+            bool decoded = false;
+
+            const uint8_t *srcVec = nullptr;
+            if (sourceAvailable && srcIndex < sourceVectorCount)
+            {
+                srcVec = srcBase + srcIndex * bytesPerVector;
+                ++srcIndex;
+                decoded = true;
+            }
+
+            auto extend16 = [&](uint16_t raw) -> uint32_t
+            {
+                if (zeroExtend)
+                    return static_cast<uint32_t>(raw);
+                return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+            };
+
+            auto extend8 = [&](uint8_t raw) -> uint32_t
+            {
+                if (zeroExtend)
+                    return static_cast<uint32_t>(raw);
+                return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+            };
+
+            bool handledFormat = true;
+            if (!decoded)
+            {
+                handledFormat = false;
+            }
+            else if (vl == 0u)
+            {
+                if (components == 1)
+                {
+                    uint32_t scalar = 0;
+                    std::memcpy(&scalar, srcVec, sizeof(scalar));
+                    decompressed[0] = scalar;
+                    decompressed[1] = scalar;
+                    decompressed[2] = scalar;
+                    decompressed[3] = scalar;
+                }
+                else
+                {
+                    const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                    for (uint32_t c = 0; c < limit; ++c)
+                    {
+                        uint32_t scalar = 0;
+                        std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
+                        decompressed[c] = scalar;
+                    }
+                }
+            }
+            else if (vl == 1u)
+            {
+                if (components == 1)
+                {
+                    uint16_t raw = 0;
+                    std::memcpy(&raw, srcVec, sizeof(raw));
+                    const uint32_t scalar = extend16(raw);
+                    decompressed[0] = scalar;
+                    decompressed[1] = scalar;
+                    decompressed[2] = scalar;
+                    decompressed[3] = scalar;
+                }
+                else
+                {
+                    const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                    for (uint32_t c = 0; c < limit; ++c)
+                    {
+                        uint16_t raw = 0;
+                        std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                        decompressed[c] = extend16(raw);
+                    }
+                }
+            }
+            else if (vl == 2u)
+            {
+                if (components == 1)
+                {
+                    const uint32_t scalar = extend8(srcVec[0]);
+                    decompressed[0] = scalar;
+                    decompressed[1] = scalar;
+                    decompressed[2] = scalar;
+                    decompressed[3] = scalar;
+                }
+                else
+                {
+                    const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                    for (uint32_t c = 0; c < limit; ++c)
+                    {
+                        decompressed[c] = extend8(srcVec[c]);
+                    }
+                }
+            }
+            else if (vl == 3u && vn == 3u)
+            {
+                // V4-5: packed color-like format in a single 16-bit value.
+                uint16_t packed = 0;
+                std::memcpy(&packed, srcVec, sizeof(packed));
+                decompressed[0] = packed & 0x1Fu;
+                decompressed[1] = (packed >> 5) & 0x1Fu;
+                decompressed[2] = (packed >> 10) & 0x1Fu;
+                decompressed[3] = (packed >> 15) & 0x01u;
+            }
+            else
+            {
+                handledFormat = false;
+            }
+
+            // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+            if (!handledFormat && decoded && !maskEnable && (regMode == 0u || regMode == 3u))
+            {
+                uint32_t copyBytes = (bytesPerVector < 16u) ? bytesPerVector : 16u;
+                if (writeVuMem)
+                    std::memcpy(vu1Data + destOff, srcVec, copyBytes);
+                continue;
+            }
+
+            const bool canAdd = (vl != 3u || vn != 3u);
+            const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
+            const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
+
+            for (uint32_t field = 0u; field < 4u; ++field)
+            {
+                uint32_t maskSpec = 0u;
+                if (maskEnable)
+                {
+                    const uint32_t shift = ((maskCycle * 4u) + field) * 2u;
+                    maskSpec = (maskBits >> shift) & 0x3u;
+                }
+
+                // In fill-write cycles with suspended source reads, treat raw-data selections as row-fill.
+                if (!decoded && maskSpec == 0u)
+                    maskSpec = 1u;
+
+                uint32_t writeVal = lanes[field];
+                if (maskSpec == 0u)
+                {
+                    if (handledFormat)
+                    {
+                        writeVal = decompressed[field];
+                        if (canAdd && (mode == 1u || mode == 2u))
+                        {
+                            writeVal = writeVal + row[field];
+                            if (mode == 2u)
+                                row[field] = writeVal;
+                        }
+                    }
+                }
+                else if (maskSpec == 1u)
+                {
+                    writeVal = row[field];
+                }
+                else if (maskSpec == 2u)
+                {
+                    writeVal = col[colIdx];
+                }
+                else
+                {
+                    continue; // write-protect
+                }
+
+                lanes[field] = writeVal;
+            }
+
+            if (writeVuMem)
+                std::memcpy(vu1Data + destOff, lanes, sizeof(lanes));
+        }
+    }
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     processVIF1Stream(data, sizeBytes, vu1ThreadQueues() ? Vif1Pass::Ee : Vif1Pass::Inline);
@@ -744,202 +953,15 @@ void PS2Memory::processVIF1Stream(const uint8_t *data, uint32_t sizeBytes, Vif1P
             if (unpackHere)
             {
                 const uint8_t *srcBase = data + pos;
-                uint32_t srcIndex = 0u;
-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
-                {
-                    const uint32_t cyclePos = writeIndex % wl;
-                    const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
-
-                    uint32_t destVec = 0;
-                    if (cl >= wl)
-                    {
-                        destVec = (vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu;
-                    }
-                    else
-                    {
-                        destVec = (vuAddr + writeIndex) & 0x3FFu;
-                    }
-
-                    uint32_t destOff = destVec * 16u;
-                    if (destOff + 16u > PS2_VU1_DATA_SIZE)
-                    {
-                        if (sourceAvailable && srcIndex < sourceVectorCount)
-                            ++srcIndex;
-                        continue;
-                    }
-
-                    uint32_t lanes[4] = {0u, 0u, 0u, 0u};
-                    if (readVuMem)
-                        std::memcpy(lanes, m_vu1Data + destOff, sizeof(lanes));
-                    uint32_t decompressed[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
-                    bool decoded = false;
-
-                    const uint8_t *srcVec = nullptr;
-                    if (sourceAvailable && srcIndex < sourceVectorCount)
-                    {
-                        srcVec = srcBase + srcIndex * bytesPerVector;
-                        ++srcIndex;
-                        decoded = true;
-                    }
-
-                    auto extend16 = [&](uint16_t raw) -> uint32_t
-                    {
-                        if (zeroExtend)
-                            return static_cast<uint32_t>(raw);
-                        return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
-                    };
-
-                    auto extend8 = [&](uint8_t raw) -> uint32_t
-                    {
-                        if (zeroExtend)
-                            return static_cast<uint32_t>(raw);
-                        return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
-                    };
-
-                    bool handledFormat = true;
-                    if (!decoded)
-                    {
-                        handledFormat = false;
-                    }
-                    else if (vl == 0u)
-                    {
-                        if (components == 1)
-                        {
-                            uint32_t scalar = 0;
-                            std::memcpy(&scalar, srcVec, sizeof(scalar));
-                            decompressed[0] = scalar;
-                            decompressed[1] = scalar;
-                            decompressed[2] = scalar;
-                            decompressed[3] = scalar;
-                        }
-                        else
-                        {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
-                            for (uint32_t c = 0; c < limit; ++c)
-                            {
-                                uint32_t scalar = 0;
-                                std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
-                                decompressed[c] = scalar;
-                            }
-                        }
-                    }
-                    else if (vl == 1u)
-                    {
-                        if (components == 1)
-                        {
-                            uint16_t raw = 0;
-                            std::memcpy(&raw, srcVec, sizeof(raw));
-                            const uint32_t scalar = extend16(raw);
-                            decompressed[0] = scalar;
-                            decompressed[1] = scalar;
-                            decompressed[2] = scalar;
-                            decompressed[3] = scalar;
-                        }
-                        else
-                        {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
-                            for (uint32_t c = 0; c < limit; ++c)
-                            {
-                                uint16_t raw = 0;
-                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
-                                decompressed[c] = extend16(raw);
-                            }
-                        }
-                    }
-                    else if (vl == 2u)
-                    {
-                        if (components == 1)
-                        {
-                            const uint32_t scalar = extend8(srcVec[0]);
-                            decompressed[0] = scalar;
-                            decompressed[1] = scalar;
-                            decompressed[2] = scalar;
-                            decompressed[3] = scalar;
-                        }
-                        else
-                        {
-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
-                            for (uint32_t c = 0; c < limit; ++c)
-                            {
-                                decompressed[c] = extend8(srcVec[c]);
-                            }
-                        }
-                    }
-                    else if (vl == 3u && vn == 3u)
-                    {
-                        // V4-5: packed color-like format in a single 16-bit value.
-                        uint16_t packed = 0;
-                        std::memcpy(&packed, srcVec, sizeof(packed));
-                        decompressed[0] = packed & 0x1Fu;
-                        decompressed[1] = (packed >> 5) & 0x1Fu;
-                        decompressed[2] = (packed >> 10) & 0x1Fu;
-                        decompressed[3] = (packed >> 15) & 0x01u;
-                    }
-                    else
-                    {
-                        handledFormat = false;
-                    }
-
-                    // Unknown compressed format fallback: preserve legacy raw-copy behavior.
-                    if (!handledFormat && decoded && !maskEnable && (regs.mode == 0u || regs.mode == 3u))
-                    {
-                        uint32_t copyBytes = (bytesPerVector < 16u) ? bytesPerVector : 16u;
-                        if (writeVuMem)
-                            std::memcpy(m_vu1Data + destOff, srcVec, copyBytes);
-                        continue;
-                    }
-
-                    const bool canAdd = (vl != 3u || vn != 3u);
-                    const uint32_t mode = regs.mode & 3u;
-                    const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
-                    const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
-
-                    for (uint32_t field = 0u; field < 4u; ++field)
-                    {
-                        uint32_t maskSpec = 0u;
-                        if (maskEnable)
-                        {
-                            const uint32_t shift = ((maskCycle * 4u) + field) * 2u;
-                            maskSpec = (regs.mask >> shift) & 0x3u;
-                        }
-
-                        // In fill-write cycles with suspended source reads, treat raw-data selections as row-fill.
-                        if (!decoded && maskSpec == 0u)
-                            maskSpec = 1u;
-
-                        uint32_t writeVal = lanes[field];
-                        if (maskSpec == 0u)
-                        {
-                            if (handledFormat)
-                            {
-                                writeVal = decompressed[field];
-                                if (canAdd && (mode == 1u || mode == 2u))
-                                {
-                                    writeVal = writeVal + regs.row[field];
-                                    if (mode == 2u)
-                                        regs.row[field] = writeVal;
-                                }
-                            }
-                        }
-                        else if (maskSpec == 1u)
-                        {
-                            writeVal = regs.row[field];
-                        }
-                        else if (maskSpec == 2u)
-                        {
-                            writeVal = regs.col[colIdx];
-                        }
-                        else
-                        {
-                            continue; // write-protect
-                        }
-
-                        lanes[field] = writeVal;
-                    }
-
-                    if (writeVuMem)
-                        std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
-                }
+                uint32_t row[4];
+                uint32_t col[4];
+                std::memcpy(row, regs.row, sizeof(row));
+                std::memcpy(col, regs.col, sizeof(col));
+                vif1UnpackVectors(m_vu1Data, srcBase, writeVectorCount, sourceVectorCount, bytesPerVector, cl, wl, vuAddr, vn,
+                                  vl, components, maskEnable, zeroExtend, readVuMem, writeVuMem, regs.mode, regs.mask, row,
+                                  col);
+                if ((regs.mode & 3u) == 2u)
+                    std::memcpy(regs.row, row, sizeof(row));
             }
             pos += totalBytes;
 
