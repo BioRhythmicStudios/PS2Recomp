@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_vu1_thread.h"
 
 namespace ps2_stubs
 {
@@ -743,6 +744,7 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x20u, 5u);
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
+        mem.vu1ThreadWait(Vu1Thread::kWaitGsStub); // the download reads what the transfer just set up
 
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);

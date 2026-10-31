@@ -12,6 +12,7 @@
 #include "runtime/ps2_present_pacing.h"
 #include "runtime/ps2_exit_reason.h"
 #include "runtime/ps2_vu1_overlap_model.h"
+#include "runtime/ps2_vu1_thread.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -774,6 +775,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        stopVu1Thread();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -986,6 +988,8 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 bool PS2Runtime::syncCoreSubsystems()
 {
     ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsStub);
+    // HLE GS entry points come through here before they use the GS directly.
+    m_memory.vu1ThreadWait(Vu1Thread::kWaitGsStub);
     uint8_t *const rdram = m_memory.getRDRAM();
     uint8_t *const gsVram = m_memory.getGSVRAM();
     if (!rdram || !gsVram)
@@ -1004,44 +1008,71 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // On the PS2X_VU1_THREAD worker the EE context belongs to the game thread: kicks
+                                     // with the D/T stop bits on run inline, so here they are off.
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!Vu1Thread::onWorker())
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      ps2_host_profile::Scope profileScope(ps2_host_profile::kVu1);
                                      ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kSplit);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // On the PS2X_VU1_THREAD worker the EE context belongs to the game thread: kicks
+                                     // with the D/T stop bits on run inline, so here they are off.
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!Vu1Thread::onWorker())
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      ps2_host_profile::Scope profileScope(ps2_host_profile::kVu1);
                                      ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kSplit);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    // PS2X_VU1_THREAD: the game thread decides per kick whether VU1 may run on the worker (D/T stop bits off), and
+    // clears VPU-STAT's D/T stop flags for each MSCAL as the inline run would.
+    m_memory.setVu1ThreadHooks(
+        [this]()
+        {
+            const R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            if (!cpuContext)
+                cpuContext = &m_cpuContext;
+            return (cpuContext->vu0_fbrst & ((1u << 10) | (1u << 11))) != 0u;
+        },
+        [this]()
+        {
+            R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            if (!cpuContext)
+                cpuContext = &m_cpuContext;
+            cpuContext->vu0_vpu_stat &= ~0x0600u;
+        });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -2809,8 +2840,40 @@ void PS2Runtime::setHeadless(bool headless, double runTimeLimitSeconds)
     m_runTimeLimitSeconds = runTimeLimitSeconds;
 }
 
+void PS2Runtime::startVu1ThreadIfRequested(bool gsWorker)
+{
+    const char *env = std::getenv("PS2X_VU1_THREAD");
+    if (!env || env[0] != '1')
+        return;
+    if (gsWorker)
+    {
+        RUNTIME_LOG("[run] PS2X_VU1_THREAD=1 ignored: not supported together with PS2X_GS_THREAD=1");
+        return;
+    }
+    if (ps2_vu1_overlap_model::state().enabled)
+    {
+        // The model times work as if it ran inline on one thread.
+        ps2_vu1_overlap_model::state().enabled = false;
+        RUNTIME_LOG("[run] PS2X_VU1_OVERLAP_MODEL disabled: PS2X_VU1_THREAD=1 runs the real worker");
+    }
+    m_memory.startVu1Thread();
+    RUNTIME_LOG("[run] VU1 back-end worker thread enabled (PS2X_VU1_THREAD=1)");
+}
+
+void PS2Runtime::stopVu1Thread()
+{
+    if (!m_memory.vu1ThreadActive())
+        return;
+    m_memory.stopVu1Thread();
+    if (const uint64_t checks = m_memory.vu1ThreadChecks())
+        RUNTIME_LOG("[run] VU1 worker VIF1 state checks: " << checks << ", mismatches: "
+                                                             << m_memory.vu1ThreadCheckMismatches());
+    RUNTIME_LOG("[run] VU1 back-end worker thread stopped");
+}
+
 void PS2Runtime::runHeadless()
 {
+    startVu1ThreadIfRequested(false);
     std::atomic<bool> gameThreadFinished{false};
     std::thread gameThread([&]()
                            {
@@ -2847,6 +2910,7 @@ void PS2Runtime::runHeadless()
     {
         gameThread.join();
     }
+    stopVu1Thread();
     ps2_pacing_trace::write();
 }
 
@@ -2927,6 +2991,7 @@ void PS2Runtime::run()
             } });
         RUNTIME_LOG("[run] GS worker thread enabled (PS2X_GS_THREAD=1)");
     }
+    startVu1ThreadIfRequested(gsQueue != nullptr);
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3083,6 +3148,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    stopVu1Thread();
     ps2_pacing_trace::write();
     if (gsQueue)
     {

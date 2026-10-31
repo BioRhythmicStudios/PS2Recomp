@@ -3,6 +3,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1_overlap_model.h"
+#include "runtime/ps2_vu1_thread.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
@@ -47,6 +48,68 @@ namespace
     {
         return Ps2AddressInRange(addr, PS2_IO_BASE, PS2_IO_SIZE);
     }
+
+    // The register side of an EE write to a VIF1 register. The game thread and the PS2X_VU1_THREAD worker apply the
+    // same writes to their own copies, so both parse the stream with identical state.
+    void applyVif1RegisterWrite(VIFRegisters &regs, uint32_t address, uint32_t value)
+    {
+        switch (address)
+        {
+        case 0x10003C10u:     // VIF1_FBRST
+            if (value & 0x1u) // RST
+                std::memset(&regs, 0, sizeof(regs));
+            if (value & 0x8u) // STC
+                regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+            break;
+        case 0x10003C30u:
+            regs.mark = value & 0xFFFFu;
+            regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
+            break;
+        case 0x10003C40u:
+            regs.cycle = value & 0xFFFFu;
+            break;
+        case 0x10003C50u:
+            regs.mode = value & 0x3u;
+            break;
+        case 0x10003C60u:
+            regs.num = value & 0xFFu;
+            break;
+        case 0x10003C70u:
+            regs.mask = value;
+            break;
+        case 0x10003C80u:
+            regs.code = value;
+            break;
+        case 0x10003C90u:
+            regs.itops = value & 0x3FFu;
+            break;
+        case 0x10003CA0u:
+            regs.base = value & 0x3FFu;
+            break;
+        case 0x10003CB0u:
+            regs.ofst = value & 0x3FFu;
+            break;
+        case 0x10003CC0u:
+            regs.tops = value & 0x3FFu;
+            break;
+        case 0x10003CD0u:
+            regs.itop = value & 0x3FFu;
+            break;
+        case 0x10003CE0u:
+            regs.top = value & 0x3FFu;
+            break;
+        default:
+            break;
+        }
+    }
+
+    // What PS2X_VU1_THREAD_CHECK compares: the VIF1 parse state both threads keep.
+    struct Vif1ParseState
+    {
+        VIFRegisters regs;
+        uint32_t pendingImageQwc;
+        uint32_t pendingDirectHl;
+    };
 
     inline uint64_t *gsRegPtr(GSRegisters &gs, uint32_t addr)
     {
@@ -249,6 +312,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    stopVu1Thread();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -565,11 +629,15 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVuMem);
+        vu1ThreadWait(Vu1Thread::kWaitVuMem);
         return ptr;
     }
     const uint8_t *ptr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
     if (ptr)
+    {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVuMem);
+        vu1ThreadWait(Vu1Thread::kWaitVuMem);
+    }
     return ptr;
 }
 
@@ -753,6 +821,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     if (isGsPrivReg(address))
     {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -802,6 +871,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -973,6 +1043,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1035,6 +1106,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1201,6 +1273,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
@@ -1249,13 +1322,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
 
-        switch (address)
+        // The worker's copy takes the same write, ahead of anything the write itself releases (STC).
+        if (vu1ThreadQueues())
+            m_vu1Thread->append(Vu1Thread::kVif1Reg, address, value);
+        applyVif1RegisterWrite(vif1_regs, address, value);
+        if (address == 0x10003C10u) // VIF1_FBRST
         {
-        case 0x10003C10u:     // VIF1_FBRST
             if (value & 0x1u) // RST
             {
                 const bool wasPath3Masked = m_path3Masked;
-                std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
                 m_vif1Stalled = false;
@@ -1265,50 +1340,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     flushMaskedPath3Packets();
             }
             if (value & 0x8u) // STC
-            {
-                vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
                 resumeStalledVif1();
-            }
-            break;
-        case 0x10003C30u:
-            vif1_regs.mark = value & 0xFFFFu;
-            vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
-            break;
-        case 0x10003C40u:
-            vif1_regs.cycle = value & 0xFFFFu;
-            break;
-        case 0x10003C50u:
-            vif1_regs.mode = value & 0x3u;
-            break;
-        case 0x10003C60u:
-            vif1_regs.num = value & 0xFFu;
-            break;
-        case 0x10003C70u:
-            vif1_regs.mask = value;
-            break;
-        case 0x10003C80u:
-            vif1_regs.code = value;
-            break;
-        case 0x10003C90u:
-            vif1_regs.itops = value & 0x3FFu;
-            break;
-        case 0x10003CA0u:
-            vif1_regs.base = value & 0x3FFu;
-            break;
-        case 0x10003CB0u:
-            vif1_regs.ofst = value & 0x3FFu;
-            break;
-        case 0x10003CC0u:
-            vif1_regs.tops = value & 0x3FFu;
-            break;
-        case 0x10003CD0u:
-            vif1_regs.itop = value & 0x3FFu;
-            break;
-        case 0x10003CE0u:
-            vif1_regs.top = value & 0x3FFu;
-            break;
-        default:
-            break;
         }
 
         return true;
@@ -1821,8 +1853,41 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+namespace
+{
+    // PS2X_VU1_THREAD: a kick that must run inline (the VU1 D/T stop bits are on, so VU1 results reach the EE
+    // context) waits for the worker, runs as without it, then hands the resulting VIF1 parse state to the worker.
+    struct Vu1InlineKickScope
+    {
+        Vu1InlineKickScope(PS2Memory &memory, bool &inlineKick, bool needed)
+            : m_memory(memory), m_inlineKick(inlineKick), m_active(needed)
+        {
+            if (!m_active)
+                return;
+            m_memory.vu1Thread()->noteFallback(Vu1Thread::kWaitInline);
+            m_memory.vu1ThreadWait(Vu1Thread::kWaitInline);
+            m_inlineKick = true;
+        }
+        ~Vu1InlineKickScope()
+        {
+            if (!m_active)
+                return;
+            m_inlineKick = false;
+            m_memory.m_vif1WorkerRegs = m_memory.vif1_regs;
+            m_memory.m_vif1WorkerPendingPath2ImageQwc = m_memory.m_vif1PendingPath2ImageQwc;
+            m_memory.m_vif1WorkerPendingPath2DirectHl = m_memory.m_vif1PendingPath2DirectHl;
+        }
+        PS2Memory &m_memory;
+        bool &m_inlineKick;
+        bool m_active;
+    };
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    Vu1InlineKickScope inlineKick(*this, m_vu1InlineKick,
+                                  vu1ThreadQueues() && !m_pendingVif1Transfers.empty() && m_vu1NeedsInlineFn &&
+                                      m_vu1NeedsInlineFn());
     if (!m_pendingVif0Transfers.empty())
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncVif0);
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2031,8 +2096,9 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
+    drainGifArbiter();
+    if (vu1ThreadQueues())
+        m_vu1Thread->publish();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -2099,13 +2165,17 @@ void PS2Memory::resumeStalledVif1()
     if (vif1IrqTraceEnabled())
         std::fprintf(stderr, "[vif1-irq] STC resume, %zu bytes held\n", m_vif1StalledData.size());
     ps2_vu1_overlap_model::WorkScope overlapWork(ps2_vu1_overlap_model::kWhole);
+    Vu1InlineKickScope inlineKick(*this, m_vu1InlineKick,
+                                  vu1ThreadQueues() && !m_vif1StalledData.empty() && m_vu1NeedsInlineFn &&
+                                      m_vu1NeedsInlineFn());
     m_vif1Stalled = false;
     std::vector<uint8_t> rest;
     rest.swap(m_vif1StalledData);
     if (!rest.empty())
         processVIF1Data(rest.data(), static_cast<uint32_t>(rest.size()));
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
+    drainGifArbiter();
+    if (vu1ThreadQueues())
+        m_vu1Thread->publish();
     if (!m_vif1Stalled && m_vif1DmaCompletionDeferred)
         completeVif1Dma();
 }
@@ -2155,9 +2225,12 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
     if (m_path3Masked || m_path3MaskedFifo.empty())
         return;
 
+    const bool queue = vu1ThreadQueues();
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
     {
-        if (m_gifArbiter)
+        if (queue)
+            m_vu1Thread->append(Vu1Thread::kGif, static_cast<uint32_t>(GifPathId::Path3), 0u, packetData, packetSize);
+        else if (m_gifArbiter)
             m_gifArbiter->submit(GifPathId::Path3, packetData, packetSize, false);
         else if (m_gifPacketCallback)
             m_gifPacketCallback(packetData, packetSize);
@@ -2170,8 +2243,8 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
     }
     m_path3MaskedFifo.clear();
 
-    if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
+    if (drainImmediately)
+        drainGifArbiter();
 }
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl,
@@ -2190,6 +2263,17 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
+    if (vu1ThreadQueues())
+    {
+        // The game thread only submits PATH3 here (PATH1/2 come from the worker's VU1 and VIF1 pass).
+        m_vu1Thread->append(Vu1Thread::kGif,
+                            static_cast<uint32_t>(pathId) | (path2DirectHl ? 0x100u : 0u) | (syntheticImageTag ? 0x200u : 0u),
+                            0u, data, sizeBytes);
+        if (drainImmediately)
+            m_vu1Thread->append(Vu1Thread::kGifDrain, 0u, 0u);
+        return;
+    }
+
     if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, syntheticImageTag);
     else if (m_gifPacketCallback)
@@ -2197,6 +2281,117 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (m_gifArbiter && drainImmediately)
         m_gifArbiter->drain();
+}
+
+void PS2Memory::drainGifArbiter()
+{
+    if (vu1ThreadQueues())
+        m_vu1Thread->append(Vu1Thread::kGifDrain, 0u, 0u);
+    else if (m_gifArbiter)
+        m_gifArbiter->drain();
+}
+
+bool PS2Memory::vu1ThreadQueues() const
+{
+    return m_vu1Thread && !m_vu1InlineKick && !Vu1Thread::onWorker();
+}
+
+void PS2Memory::startVu1Thread()
+{
+    if (m_vu1Thread)
+        return;
+    m_vif1WorkerRegs = vif1_regs;
+    m_vif1WorkerPendingPath2ImageQwc = m_vif1PendingPath2ImageQwc;
+    m_vif1WorkerPendingPath2DirectHl = m_vif1PendingPath2DirectHl;
+    const char *check = std::getenv("PS2X_VU1_THREAD_CHECK");
+    m_vu1ThreadCheck = check && check[0] == '1';
+    m_vu1Thread = std::make_unique<Vu1Thread>([this](const Vu1Thread::Record &rec, const uint8_t *payload)
+                                              { vu1ThreadApply(rec.kind, rec.a, rec.b, payload, rec.size); });
+}
+
+void PS2Memory::stopVu1Thread()
+{
+    if (!m_vu1Thread)
+        return;
+    m_vu1Thread->stop();
+    m_vu1Thread.reset();
+}
+
+void PS2Memory::vu1ThreadWaitSlow(uint32_t reason) const
+{
+    if (Vu1Thread::onWorker())
+        return;
+    m_vu1Thread->wait(static_cast<Vu1Thread::WaitReason>(reason));
+    if (reason == Vu1Thread::kWaitFrame)
+        m_vu1Thread->maybeReport();
+}
+
+void PS2Memory::vu1ThreadForwardVif1(const uint8_t *data, uint32_t sizeBytes, bool check)
+{
+    m_vu1Thread->append(Vu1Thread::kVif1Data, 0u, 0u, data, sizeBytes);
+    if (check && m_vu1ThreadCheck)
+    {
+        Vif1ParseState state{};
+        state.regs = vif1_regs;
+        state.pendingImageQwc = m_vif1PendingPath2ImageQwc;
+        state.pendingDirectHl = m_vif1PendingPath2DirectHl ? 1u : 0u;
+        m_vu1Thread->append(Vu1Thread::kVif1Check, 0u, 0u, reinterpret_cast<const uint8_t *>(&state), sizeof(state));
+    }
+}
+
+void PS2Memory::vu1ThreadApply(uint32_t kind, uint32_t a, uint32_t b, const uint8_t *payload, uint32_t size)
+{
+    switch (kind)
+    {
+    case Vu1Thread::kVif1Data:
+        processVIF1Stream(payload, size, Vif1Pass::Worker);
+        break;
+    case Vu1Thread::kVif1Reg:
+        applyVif1RegisterWrite(m_vif1WorkerRegs, a, b);
+        if (a == 0x10003C10u && (b & 0x1u) != 0u) // FBRST.RST
+        {
+            m_vif1WorkerPendingPath2ImageQwc = 0u;
+            m_vif1WorkerPendingPath2DirectHl = false;
+        }
+        break;
+    case Vu1Thread::kGif:
+    {
+        const GifPathId path = static_cast<GifPathId>(a & 0xFFu);
+        if (m_gifArbiter)
+            m_gifArbiter->submit(path, payload, size, (a & 0x100u) != 0u, (a & 0x200u) != 0u);
+        else if (m_gifPacketCallback && size >= 16u)
+            m_gifPacketCallback(payload, size);
+        break;
+    }
+    case Vu1Thread::kGifDrain:
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+        break;
+    case Vu1Thread::kVif1Check:
+    {
+        Vif1ParseState ee{};
+        std::memcpy(&ee, payload, std::min<size_t>(size, sizeof(ee)));
+        Vif1ParseState mine{};
+        mine.regs = m_vif1WorkerRegs;
+        mine.pendingImageQwc = m_vif1WorkerPendingPath2ImageQwc;
+        mine.pendingDirectHl = m_vif1WorkerPendingPath2DirectHl ? 1u : 0u;
+        m_vu1Checks.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(&ee, &mine, sizeof(ee)) != 0)
+        {
+            const uint64_t n = m_vu1CheckMismatches.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8u)
+                std::fprintf(stderr,
+                             "[vu1-thread] VIF1 state mismatch #%llu: game thread code=0x%08X tops=%u itops=%u stat=0x%X "
+                             "pending=%u | worker code=0x%08X tops=%u itops=%u stat=0x%X pending=%u\n",
+                             static_cast<unsigned long long>(n + 1u), ee.regs.code, ee.regs.tops, ee.regs.itops,
+                             ee.regs.stat, ee.pendingImageQwc, mine.regs.code, mine.regs.tops, mine.regs.itops,
+                             mine.regs.stat, mine.pendingImageQwc);
+        }
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
@@ -2241,11 +2436,12 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
         return false;
-    if (m_gifArbiter && !m_gifArbiter->empty())
-        return false;
     if ((chcr & 0x100u) == 0u || ((chcr >> 2u) & 0x3u) != 1u)
         return false;
     if ((chcr & (1u << 7u)) != 0u || ((chcr >> 4u) & 0x3u) != 0u)
+        return false;
+    vu1ThreadWait(Vu1Thread::kWaitGsStub);
+    if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
 
     const auto dctrlIt = m_ioRegisters.find(D_CTRL);
@@ -2433,11 +2629,12 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
 
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
         return false;
-    if (m_gifArbiter && !m_gifArbiter->empty())
-        return false;
     if ((chcr & 0x100u) == 0u || ((chcr >> 2u) & 0x3u) != 1u)
         return false;
     if ((chcr & (1u << 7u)) != 0u || ((chcr >> 4u) & 0x3u) != 0u)
+        return false;
+    vu1ThreadWait(Vu1Thread::kWaitGsStub);
+    if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
 
     const auto dctrlIt = m_ioRegisters.find(D_CTRL);
@@ -2536,6 +2733,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)

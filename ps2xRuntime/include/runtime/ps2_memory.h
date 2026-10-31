@@ -24,6 +24,7 @@
 #endif
 
 class GS;
+class Vu1Thread;
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
@@ -393,6 +394,33 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
     const Vu1MscntCallback &vu1MscntCallback() const { return m_vu1MscntCallback; }
+
+    // PS2X_VU1_THREAD=1 (ps2_vu1_thread.h, VU1_THREAD_PLAN.md): VU1 programs, VU1 memory, the GIF arbiter and the GS
+    // run on a worker thread; VIF1 parsing, VIF1 registers, stalls, interrupts and DMA completion stay on the game
+    // thread. Off (the default), every path is the inline one.
+    // needsInline: called at each VIF1 kick on the game thread; true makes the kick run inline (VU1 D/T stops on).
+    // eeMscal: called on the game thread for each MSCAL/MSCNT the game-thread pass parses (the worker runs VU1).
+    using Vu1NeedsInlineFn = std::function<bool()>;
+    using Vu1EeMscalFn = std::function<void()>;
+    void setVu1ThreadHooks(Vu1NeedsInlineFn needsInline, Vu1EeMscalFn eeMscal)
+    {
+        m_vu1NeedsInlineFn = std::move(needsInline);
+        m_vu1EeMscalFn = std::move(eeMscal);
+    }
+    void startVu1Thread();
+    void stopVu1Thread();
+    bool vu1ThreadActive() const { return m_vu1Thread != nullptr; }
+    Vu1Thread *vu1Thread() { return m_vu1Thread.get(); }
+    // Game thread: wait until the worker has applied everything handed to it (no-op when inline or on the worker).
+    // reason is a Vu1Thread::WaitReason.
+    void vu1ThreadWait(uint32_t reason) const
+    {
+        if (m_vu1Thread)
+            vu1ThreadWaitSlow(reason);
+    }
+    // PS2X_VU1_THREAD_CHECK=1: the worker compares its VIF1 register copy with the game thread's after every stretch.
+    uint64_t vu1ThreadCheckMismatches() const { return m_vu1CheckMismatches.load(std::memory_order_relaxed); }
+    uint64_t vu1ThreadChecks() const { return m_vu1Checks.load(std::memory_order_relaxed); }
     // Called after the EE writes a privileged GS register other than CSR (regOffset from 0x12000000).
     using GsPrivWriteCallback = std::function<void(uint32_t regOffset)>;
     void setGsPrivWriteCallback(GsPrivWriteCallback cb) { m_gsPrivWriteCallback = std::move(cb); }
@@ -419,6 +447,15 @@ public:
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    // Inline: everything, as without the worker. Ee: the game-thread pass of the threaded mode (registers, stalls,
+    // interrupts; the parsed stretches go to the worker). Worker: the back-end pass (VU1 memory, VU1, GIF).
+    enum class Vif1Pass : uint8_t
+    {
+        Inline,
+        Ee,
+        Worker
+    };
+    void processVIF1Stream(const uint8_t *data, uint32_t sizeBytes, Vif1Pass pass);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
     std::vector<uint32_t> consumeCompletedIntcCauses();
@@ -552,7 +589,25 @@ public:
     void raiseDmaChannelStatus(uint32_t channelBit);
     void completeVif1Dma();
     void resumeStalledVif1();
-    uint32_t submitPendingPath2Image(const uint8_t *data, uint32_t availableQw);
+    uint32_t submitPendingPath2Image(const uint8_t *data, uint32_t availableQw, uint32_t &pendingQwc, bool &pendingDirectHl,
+                                     bool submit);
+    void drainGifArbiter();
+    bool vu1ThreadQueues() const; // this thread hands back-end work to the worker instead of doing it
+    void vu1ThreadWaitSlow(uint32_t reason) const;
+    void vu1ThreadForwardVif1(const uint8_t *data, uint32_t sizeBytes, bool check);
+    void vu1ThreadApply(uint32_t kind, uint32_t a, uint32_t b, const uint8_t *payload, uint32_t size);
+
+    std::unique_ptr<Vu1Thread> m_vu1Thread;
+    bool m_vu1InlineKick = false; // threaded mode, but this kick runs inline (the worker is idle)
+    bool m_vu1ThreadCheck = false;
+    Vu1NeedsInlineFn m_vu1NeedsInlineFn;
+    Vu1EeMscalFn m_vu1EeMscalFn;
+    // The worker's copy of the VIF1 parse state, advanced by the same stream and register writes as vif1_regs.
+    VIFRegisters m_vif1WorkerRegs{};
+    uint32_t m_vif1WorkerPendingPath2ImageQwc = 0u;
+    bool m_vif1WorkerPendingPath2DirectHl = false;
+    std::atomic<uint64_t> m_vu1CheckMismatches{0};
+    std::atomic<uint64_t> m_vu1Checks{0};
 };
 
 #endif // PS2_MEMORY_H
