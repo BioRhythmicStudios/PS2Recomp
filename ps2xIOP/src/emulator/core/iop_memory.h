@@ -57,7 +57,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
         [[nodiscard]] bool freeAllocation(uint32_t address);
+        // The largest free block of the heap, and all its free blocks together (QueryMaxFreeMemSize,
+        // QueryTotalFreeMemSize).
         [[nodiscard]] uint32_t maxFreeMemory() const;
+        [[nodiscard]] uint32_t totalFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
@@ -82,7 +85,6 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

@@ -373,6 +373,65 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    // Thread churn: the main thread starts short-lived threads one after another, as a movie player does. Each one
+    // runs a callback on an invocation stack, then exits and deletes itself.
+    constexpr uint32_t kThreadChurnMainPc = 0x00160600u;
+    constexpr uint32_t kThreadChurnEntryPc = 0x00160610u;
+    constexpr uint32_t kThreadChurnExitPc = 0x00160620u;
+    constexpr uint32_t kThreadChurnCallbackPc = 0x00160630u;
+    constexpr uint32_t kThreadChurnCount = 12u;
+    uint32_t g_threadChurnStarted = 0u;
+    uint32_t g_threadChurnCallbacks = 0u;
+    int g_threadChurnSema = 0;
+
+    void schedulerThreadChurnMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (g_threadChurnSema == 0)
+        {
+            g_threadChurnSema = scheduler.createSemaphore(0, 1, 0u, 0u);
+        }
+        if (g_threadChurnStarted == kThreadChurnCount)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        EeThreadCreateParams params{};
+        params.entry = kThreadChurnEntryPc;
+        params.stack = 0x00180000u;
+        params.stackSize = 0x1000u;
+        params.priority = 0;
+        const int id = scheduler.createThread(params);
+        ++g_threadChurnStarted;
+        scheduler.startThread(id, 0u, *ctx, false);
+        ctx->pc = kThreadChurnMainPc;
+        scheduler.waitSemaphore(g_threadChurnSema);
+    }
+
+    void schedulerThreadChurnEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context.pc = kThreadChurnCallbackPc;
+        setRegU32(invocation.context, 31, 0u);
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        ctx->pc = kThreadChurnExitPc;
+    }
+
+    void schedulerThreadChurnCallback(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ++g_threadChurnCallbacks;
+        ctx->pc = 0u;
+    }
+
+    void schedulerThreadChurnExit(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.signalSemaphore(g_threadChurnSema, false);
+        scheduler.exitCurrent(true);
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -600,6 +659,39 @@ void register_ps2_runtime_interrupt_tests()
             t.IsFalse(exhausted, "queued callbacks must not consume one invocation stack per pending item");
             t.Equals(g_invocationQueueRuns, 96u, "every queued callback should execute exactly once");
             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+        });
+
+        tc.Run("deleted threads give their invocation stacks back", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kThreadChurnMainPc, schedulerThreadChurnMain);
+            env.runtime.registerFunction(kThreadChurnEntryPc, schedulerThreadChurnEntry);
+            env.runtime.registerFunction(kThreadChurnExitPc, schedulerThreadChurnExit);
+            env.runtime.registerFunction(kThreadChurnCallbackPc, schedulerThreadChurnCallback);
+            // Room for two 16 KB invocation stacks, far fewer than the threads started.
+            env.runtime.setAsyncCallbackStackRegion(0x000F0000u, 0x000F8000u);
+
+            g_threadChurnStarted = 0u;
+            g_threadChurnCallbacks = 0u;
+            g_threadChurnSema = 0;
+
+            R5900Context mainContext{};
+            mainContext.pc = kThreadChurnMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            bool exhausted = false;
+            try
+            {
+                env.runtime.eeScheduler().run();
+            }
+            catch (const std::runtime_error &error)
+            {
+                exhausted = std::string_view(error.what()) == "EE invocation stack space exhausted";
+            }
+
+            t.IsFalse(exhausted, "a thread created after another was deleted must reuse its invocation stack");
+            t.Equals(g_threadChurnStarted, kThreadChurnCount, "every thread should be started");
+            t.Equals(g_threadChurnCallbacks, kThreadChurnCount, "every thread's callback should run once");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)

@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "ps2x/iop/ps2_path.h"
 #include "../../ps2xIOP/tests/iop_compat_test_support.h"
+#include "emulator/core/iop_memory.h"
 
 void register_ps2_iop_tests()
 {
@@ -69,6 +70,36 @@ void register_ps2_iop_tests()
             t.Equals(result.callbackPolicy, ps2x::iop::CallbackPolicy::RuntimeDefault,
                      "an unknown SID should preserve runtime callback handling");
 
+        });
+
+        tc.Run("IOP heap reuses freed blocks first-fit and reports its free space", [](TestCase &t)
+        {
+            using ps2x::iop::detail::IopMemory;
+            IopMemory memory;
+            const uint32_t heap = IopMemory::HeapLimit - IopMemory::HeapBase;
+            t.Equals(memory.maxFreeMemory(), heap, "an empty heap is one free block");
+
+            // MJOLNIR's bank switch: a bank buffer and a scratch block, both freed before the next bank is loaded.
+            for (int load = 0; load < 64; ++load)
+            {
+                const uint32_t bank = memory.allocate(0x18A00u, 16u);
+                const uint32_t scratch = memory.allocate(0x6280u, 16u);
+                t.Equals(bank, IopMemory::HeapBase, "the bank buffer goes back to the bottom of the heap");
+                t.Equals(scratch, IopMemory::HeapBase + 0x18A00u, "the scratch block follows it");
+                t.IsTrue(memory.freeAllocation(scratch), "free the scratch block");
+                t.IsTrue(memory.freeAllocation(bank), "free the bank buffer");
+            }
+            t.Equals(memory.totalFreeMemory(), heap, "repeated loads leave the whole heap free");
+
+            const uint32_t a = memory.allocate(0x1000u, 16u);
+            const uint32_t b = memory.allocate(0x2000u, 16u);
+            const uint32_t c = memory.allocate(0x1000u, 16u);
+            t.IsTrue(memory.freeAllocation(b), "free the middle block");
+            t.Equals(memory.totalFreeMemory(), heap - 0x2000u, "total free counts the hole");
+            t.Equals(memory.maxFreeMemory(), heap - 0x4000u, "largest free block is the one above c");
+            t.Equals(memory.allocate(0x3000u, 16u), c + 0x1000u, "a block too big for the hole goes above c");
+            t.Equals(memory.allocate(0x800u, 16u), a + 0x1000u, "a block that fits the hole goes in it");
+            t.Equals(memory.allocate(heap, 16u), 0u, "a block larger than the free space fails");
         });
 
     });
