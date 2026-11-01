@@ -674,7 +674,7 @@ bool PS2Runtime::iopAudioPacing(int32_t &ppm, bool &catchUp) const
 {
     IopAudioPlayer &p = iopAudioPlayer();
     // With the IOP on the device's clock the EE keeps its own field-rate pacing: the audio no longer depends on it.
-    if (!m_iopAudioPlayback || !p.started || m_iopAudioClock == IopAudioClock::RealTime)
+    if (!m_iopAudioPlayback || !p.started || iopOnRealTimeClock())
     {
         ppm = 0;
         catchUp = false;
@@ -874,7 +874,7 @@ void PS2Runtime::runIopUntilIdle() noexcept
 // Before any other call into the IOP. That call may wake it, so the next checkpoint asks again how long it idles.
 void PS2Runtime::runHeldIopCycles() noexcept
 {
-    if (m_iopAudioClock == IopAudioClock::RealTime && m_iopAudioPlayback)
+    if (iopOnRealTimeClock())
     {
         runIopRealTime();
         return;
@@ -942,6 +942,35 @@ void PS2Runtime::resetIop()
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 {
     return m_iopSubsystem->debugSnapshot();
+}
+
+bool PS2Runtime::iopSdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result)
+{
+    if (!m_iopSubsystem)
+        return false;
+    runHeldIopCycles();
+    const bool handled = m_iopSubsystem->sdRemote(function, args, result);
+    setIopGuestFedAudio(m_iopSubsystem->soundInputRunning());
+    return handled;
+}
+
+void PS2Runtime::setIopGuestFedAudio(bool fed) noexcept
+{
+    if (fed == m_iopGuestFedAudio)
+        return;
+    m_iopGuestFedAudio = fed;
+    if (fed)
+    {
+        // From here the IOP counts EE time on from where the RealTime clock left it.
+        m_iopHeldEeCycles = 0u;
+        m_iopIdleEeCycles = 0u;
+        m_iopRealTimeEeCycles = 0u;
+        iopAudioPlayer().realTime.store(false, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_iopRealTimeAnchored = false; // reattach to the device clock at the next update
+    }
 }
 
 uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)

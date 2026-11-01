@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,16 @@ namespace ps2x::iop::detail
 
         // Mixes `frames` output samples and appends them to `out` as interleaved signed 16-bit L/R.
         void run(uint32_t frames, std::vector<int16_t> &out);
+
+        // Sound data input: a core's auto-DMA stream of PCM blocks, each 256 left then 256 right samples. While a
+        // core's input runs, the mixer asks `fetch` for the next block as it reaches it (the DMA reads a block ahead
+        // of the output) and adds the input through BVOL and the MMIX input gates. A false return stops the input.
+        using InputFetch = std::function<bool(uint32_t core, int16_t block[512])>;
+        static constexpr uint32_t InputBlockFrames = 256u;
+        void setInputFetch(InputFetch fetch) { m_inputFetch = std::move(fetch); }
+        void startInput(uint32_t core);
+        void stopInput(uint32_t core);
+        [[nodiscard]] bool inputRunning(uint32_t core) const noexcept { return m_cores[core & 1u].inputRunning; }
 
         [[nodiscard]] uint64_t samplesMixed() const noexcept { return m_samples; }
         [[nodiscard]] uint32_t activeVoices() const noexcept;
@@ -112,6 +123,9 @@ namespace ps2x::iop::detail
             int32_t inputRight = 0;
             int32_t noiseLevel = 0;
             int32_t noiseCounter = 0;
+            bool inputRunning = false;
+            uint32_t inputFrame = InputBlockFrames; // next frame of inputBlock; a new block is due at the end
+            std::array<int16_t, 512> inputBlock{};
         };
 
         void keyOn(Core &core, uint32_t bits);
@@ -126,6 +140,7 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_ram;
         std::array<uint16_t, 0x400> m_regs{}; // raw shadow of every register halfword
         std::array<Core, 2> m_cores;
+        InputFetch m_inputFetch;
         uint64_t m_samples = 0;
         uint64_t m_keyOns = 0;
     };

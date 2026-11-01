@@ -120,6 +120,7 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            spu2.setInputFetch([this](uint32_t core, int16_t block[512]) { return libsd.fetchInputBlock(core, block); });
             reset();
         }
 
@@ -978,6 +979,20 @@ namespace ps2x::iop::detail
     {
         m_impl->idleUntil = 0;
         return m_impl->rpc.handleRpc(request, *m_impl);
+    }
+
+    bool IopEmulator::sdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result)
+    {
+        // The SPU2 first catches up with the IOP clock, so the call takes effect at the current sample.
+        if (m_impl->libsd.initialized())
+            m_impl->syncSpu2();
+        m_impl->idleUntil = 0;
+        return m_impl->libsd.remote(function, args, result);
+    }
+
+    bool IopEmulator::soundInputRunning() const noexcept
+    {
+        return m_impl->spu2.inputRunning(0u) || m_impl->spu2.inputRunning(1u);
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept

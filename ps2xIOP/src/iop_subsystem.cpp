@@ -224,6 +224,16 @@ namespace ps2x::iop
         m_impl->emulator.onSifTransfer(transfer);
     }
 
+    bool IopSubsystem::sdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result)
+    {
+        return m_impl->emulator.sdRemote(function, args, result);
+    }
+
+    bool IopSubsystem::soundInputRunning() const noexcept
+    {
+        return m_impl->emulator.soundInputRunning();
+    }
+
     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
     {
         return m_impl->emulator.allocateMemory(size, alignment);
