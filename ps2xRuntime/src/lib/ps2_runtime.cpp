@@ -2884,6 +2884,74 @@ void PS2Runtime::runHeadless()
     ps2_pacing_trace::write();
 }
 
+namespace
+{
+    // PS2X_WINDOW_MODE=borderless: start in borderless fullscreen on the monitor the window opened on.
+    // Alt+Enter switches between that and the window in either mode. The presenter's 4:3 fit fills the screen.
+    struct WindowMode
+    {
+        bool borderless = false;
+        bool wasFocused = true;
+
+        void enterBorderless()
+        {
+            ToggleBorderlessWindowed();
+            ClearWindowState(FLAG_WINDOW_TOPMOST); // raylib makes it topmost; Alt+Tab'd windows must cover it
+            HideCursor();
+            borderless = true;
+        }
+
+        void leaveBorderless()
+        {
+            ToggleBorderlessWindowed();
+            ShowCursor();
+            borderless = false;
+        }
+
+        void start()
+        {
+            const char *env = std::getenv("PS2X_WINDOW_MODE");
+            if (env && std::strcmp(env, "borderless") == 0)
+            {
+                enterBorderless();
+                RUNTIME_LOG("[run] borderless fullscreen " << GetScreenWidth() << "x" << GetScreenHeight()
+                                                           << " (PS2X_WINDOW_MODE=borderless)");
+            }
+        }
+
+        // After the window's frame has been presented (input is polled in EndDrawing).
+        void update()
+        {
+            if (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))
+            {
+                if (borderless)
+                    leaveBorderless();
+                else
+                    enterBorderless();
+                RUNTIME_LOG("[run] Alt+Enter: " << (borderless ? "borderless fullscreen " : "window ")
+                                                << GetScreenWidth() << "x" << GetScreenHeight());
+            }
+
+            // The monitor's resolution may have changed while another window had the focus: refit on return.
+            const bool focused = IsWindowFocused();
+            if (focused && !wasFocused && borderless)
+            {
+                const int monitor = GetCurrentMonitor();
+                const int width = GetMonitorWidth(monitor);
+                const int height = GetMonitorHeight(monitor);
+                if (width > 0 && height > 0 && (width != GetScreenWidth() || height != GetScreenHeight()))
+                {
+                    const Vector2 position = GetMonitorPosition(monitor);
+                    SetWindowPosition(static_cast<int>(position.x), static_cast<int>(position.y));
+                    SetWindowSize(width, height);
+                    RUNTIME_LOG("[run] borderless refit to the monitor's new resolution " << width << "x" << height);
+                }
+            }
+            wasFocused = focused;
+        }
+    };
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2923,6 +2991,9 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+
+    WindowMode windowMode;
+    windowMode.start();
 
     // PS2X_GS_THREAD=1: GS work runs on its own thread (GS_THREADING_PLAN.md). Headless runs stay inline.
     std::unique_ptr<GSAsyncQueue> gsQueue;
@@ -3096,6 +3167,7 @@ void PS2Runtime::run()
         }
         EndDrawing();
         ps2_pacing_trace::note(ps2_pacing_trace::kSwap);
+        windowMode.update();
 
         if (WindowShouldClose())
         {
