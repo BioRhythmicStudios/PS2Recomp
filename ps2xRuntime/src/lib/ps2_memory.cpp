@@ -821,9 +821,11 @@ uint32_t PS2Memory::read32(uint32_t address)
     if (isGsPrivReg(address))
     {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
-        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (regOff == kGsCsrRegOffset && gsPrivPipelined())
+            return static_cast<uint32_t>(readCsrPipelined() >> (off * 8));
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -871,8 +873,10 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         ps2_vu1_overlap_model::sync(ps2_vu1_overlap_model::kSyncGsPriv);
-        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (regOff == kGsCsrRegOffset && gsPrivPipelined())
+            return readCsrPipelined();
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -1043,9 +1047,17 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (gsPrivPipelined())
+        {
+            if (regOff == kGsCsrRegOffset)
+                writeCsrPipelined(off, value, false);
+            else
+                m_vu1Thread->append(Vu1Thread::kGsPriv, address, 4u, reinterpret_cast<const uint8_t *>(&value), 4u);
+            return;
+        }
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1106,8 +1118,16 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
-        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (gsPrivPipelined())
+        {
+            if (regOff == kGsCsrRegOffset)
+                writeCsrPipelined(0u, value, true);
+            else
+                m_vu1Thread->append(Vu1Thread::kGsPriv, address, 8u, reinterpret_cast<const uint8_t *>(&value), 8u);
+            return;
+        }
+        vu1ThreadWait(Vu1Thread::kWaitGsPriv);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -2305,8 +2325,91 @@ void PS2Memory::startVu1Thread()
     m_vif1WorkerPendingPath2DirectHl = m_vif1PendingPath2DirectHl;
     const char *check = std::getenv("PS2X_VU1_THREAD_CHECK");
     m_vu1ThreadCheck = check && check[0] == '1';
+    const char *pipeline = std::getenv("PS2X_VU1_PIPELINE");
+    m_vu1Pipeline = pipeline && pipeline[0] == '1';
+    m_csrEeBits = static_cast<uint32_t>(gs_regs.csr.load() & 0x3u);
+    m_csrClearsSinceFrame = 0u;
     m_vu1Thread = std::make_unique<Vu1Thread>([this](const Vu1Thread::Record &rec, const uint8_t *payload)
                                               { vu1ThreadApply(rec.kind, rec.a, rec.b, payload, rec.size); });
+}
+
+bool PS2Memory::gsPrivPipelined() const
+{
+    return m_vu1Pipeline && m_vu1Thread && !Vu1Thread::onWorker();
+}
+
+uint64_t PS2Memory::readCsrPipelined()
+{
+    if (++m_csrReadsThisVBlank > kCsrPollLimit)
+    {
+        stopPipeline("the game polls GS CSR");
+        return gs_regs.csr.load();
+    }
+    return (gs_regs.csr.load() & ~0x3ull) | m_csrEeBits;
+}
+
+void PS2Memory::writeCsrPipelined(uint32_t off, uint64_t value, bool full)
+{
+    // The other bits (FIELD is read-only; RESET, NFIELD, ...) take effect now, as in serial mode, leaving SIGNAL
+    // and FINISH alone: those clears are ordered after the GS work already queued.
+    const uint32_t clears = (full || off == 0u) ? static_cast<uint32_t>(value & 0x3u) : 0u;
+    if (full)
+        writeCsrFull(gs_regs.csr, value & ~0x3ull);
+    else
+        writeCsrHalf(gs_regs.csr, off, off == 0u ? static_cast<uint32_t>(value) & ~0x3u : static_cast<uint32_t>(value));
+    if (clears != 0u)
+    {
+        m_csrEeBits &= ~clears;
+        m_csrClearsSinceFrame |= clears;
+        m_vu1Thread->append(Vu1Thread::kCsrClear, 0u, clears);
+    }
+}
+
+void PS2Memory::stopPipeline(const char *why)
+{
+    m_vu1Thread->wait(Vu1Thread::kWaitFrame);
+    m_vu1Pipeline = false;
+    std::fprintf(stderr, "[vu1-thread] pipelined frames off: %s\n", why);
+}
+
+void PS2Memory::applyGsPrivWrite(uint32_t address, uint32_t width, uint64_t value)
+{
+    const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+    uint64_t *reg = gsRegPtr(gs_regs, address);
+    if (!reg)
+        return;
+    if (width == 8u)
+    {
+        *reg = value;
+    }
+    else
+    {
+        const uint32_t off = address & 7u;
+        const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
+        *reg = (*reg & ~mask) | ((value & 0xFFFFFFFFull) << (off * 8u));
+    }
+    if (m_gsPrivWriteCallback)
+        m_gsPrivWriteCallback(regOff);
+}
+
+void PS2Memory::vu1ThreadFrame(std::function<void()> present, bool exact)
+{
+    if (!m_vu1Thread || Vu1Thread::onWorker())
+    {
+        present();
+        return;
+    }
+    if (!m_vu1Pipeline || exact)
+    {
+        vu1ThreadWaitSlow(Vu1Thread::kWaitFrame);
+        present();
+        return;
+    }
+    const uint32_t clears = m_csrClearsSinceFrame;
+    m_csrClearsSinceFrame = 0u;
+    const uint64_t seq = m_vu1Thread->appendFrame(std::move(present));
+    m_csrEeBits = m_vu1Thread->waitFrame(seq - 1u) & ~clears;
+    m_vu1Thread->maybeReport();
 }
 
 void PS2Memory::stopVu1Thread()
@@ -2366,6 +2469,20 @@ void PS2Memory::vu1ThreadApply(uint32_t kind, uint32_t a, uint32_t b, const uint
     case Vu1Thread::kGifDrain:
         if (m_gifArbiter)
             m_gifArbiter->drain();
+        break;
+    case Vu1Thread::kGsPriv:
+    {
+        uint64_t value = 0u;
+        std::memcpy(&value, payload, std::min<size_t>(size, sizeof(value)));
+        applyGsPrivWrite(a, b, value);
+        break;
+    }
+    case Vu1Thread::kCsrClear:
+        gs_regs.csr.fetch_and(~static_cast<uint64_t>(b), std::memory_order_acq_rel);
+        break;
+    case Vu1Thread::kFrame:
+        m_vu1Thread->runFrame(a, [this]
+                              { return static_cast<uint32_t>(gs_regs.csr.load() & 0x3u); });
         break;
     case Vu1Thread::kVif1Check:
     {

@@ -418,6 +418,15 @@ public:
         if (m_vu1Thread)
             vu1ThreadWaitSlow(reason);
     }
+    // Game thread, at a frame boundary (sceGsSyncV or a display flip): `present` hands the frame to the presenter.
+    // Normally it waits for the worker to drain and then presents. With PS2X_VU1_PIPELINE=1 it queues `present`
+    // behind the frame's GS work and waits only for the previous frame, so the worker draws frame N while the game
+    // builds frame N+1 (as the PS2's GS drains one display list while the EE builds the next). `exact` (frame
+    // captures) always drains first. Without the worker, `present` runs at once.
+    void vu1ThreadFrame(std::function<void()> present, bool exact);
+    bool vu1ThreadPipelined() const { return m_vu1Thread && m_vu1Pipeline; }
+    // EE scheduler, at each VBlank: restarts the CSR polling count (see m_csrReadsThisVBlank).
+    void noteVBlank() { m_csrReadsThisVBlank = 0u; }
     // PS2X_VU1_THREAD_CHECK=1: the worker compares its VIF1 register copy with the game thread's after every stretch.
     uint64_t vu1ThreadCheckMismatches() const { return m_vu1CheckMismatches.load(std::memory_order_relaxed); }
     uint64_t vu1ThreadChecks() const { return m_vu1Checks.load(std::memory_order_relaxed); }
@@ -608,6 +617,22 @@ public:
     bool m_vif1WorkerPendingPath2DirectHl = false;
     std::atomic<uint64_t> m_vu1CheckMismatches{0};
     std::atomic<uint64_t> m_vu1Checks{0};
+
+    // Pipelined frames (vu1ThreadFrame). The worker owns the GS privileged registers' stream-ordered state: EE writes
+    // to them are queued (gsPrivWritePipelined). CSR reads don't wait: FIELD and the other EE-written bits are
+    // current, and SIGNAL/FINISH (set by GS packets) are as the worker left them at the previous frame boundary,
+    // less the EE's own clears since; so what the game reads never depends on how far the worker has got.
+    bool m_vu1Pipeline = false;
+    uint32_t m_csrEeBits = 0u;            // SIGNAL/FINISH as the game thread sees them
+    uint32_t m_csrClearsSinceFrame = 0u;  // SIGNAL/FINISH clears queued since the last frame boundary
+    uint32_t m_csrReadsThisVBlank = 0u;   // a game polling CSR (more than kCsrPollLimit reads in one VBlank) would
+                                          // wait for SIGNAL/FINISH, so the pipeline turns itself off
+    static constexpr uint32_t kCsrPollLimit = 64u;
+    bool gsPrivPipelined() const;
+    uint64_t readCsrPipelined();
+    void writeCsrPipelined(uint32_t off, uint64_t value, bool full);
+    void stopPipeline(const char *why);
+    void applyGsPrivWrite(uint32_t address, uint32_t width, uint64_t value);
 };
 
 #endif // PS2_MEMORY_H

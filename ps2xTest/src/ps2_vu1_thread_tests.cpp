@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -399,6 +401,114 @@ void register_ps2_vu1_thread_tests()
             t.IsTrue(!finishSet.load(), "the kick should return before the worker's GS has the packet");
             const uint64_t csr = r.mem.read64(0x12001000u);
             t.IsTrue((csr & 0x2u) != 0u, "a CSR read should see FINISH raised by the worker's GS");
+        });
+
+        tc.Run("pipelined frames: the worker presents frame N after its GS work while the game builds N+1", [](TestCase &t)
+        {
+            std::mutex m;
+            std::vector<std::string> events;
+            bool presentsOnWorker = true;
+            Rig r(true);
+            r.mem.m_vu1Pipeline = true;
+            r.arbiter.setPathPacketFn([&](GifPathId, const uint8_t *, uint32_t, bool)
+                                      {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::lock_guard<std::mutex> lock(m);
+                events.push_back("gs"); });
+            auto present = [&](const char *name)
+            {
+                return [&, name]
+                {
+                    std::lock_guard<std::mutex> lock(m);
+                    presentsOnWorker = presentsOnWorker && Vu1Thread::onWorker();
+                    events.push_back(std::string(name) + " dispfb1=" + std::to_string(r.mem.gs().dispfb1));
+                };
+            };
+            std::vector<uint8_t> s;
+            put32(s, vifCmd(0x14u, 0u, 0u)); // MSCAL: the program kicks a PATH1 packet
+            r.mem.processVIF1Data(s.data(), static_cast<uint32_t>(s.size()));
+            r.mem.write64(0x12000070u, 0x111u); // DISPFB1 for frame 1
+            r.mem.vu1ThreadFrame(present("frame1"), false);
+            {
+                std::lock_guard<std::mutex> lock(m);
+                t.IsTrue(events.empty(), "frame 1's boundary should not wait for frame 1's GS work");
+            }
+            r.mem.write64(0x12000070u, 0x222u); // DISPFB1 for frame 2: queued behind frame 1's present
+            r.mem.processVIF1Data(s.data(), static_cast<uint32_t>(s.size()));
+            r.mem.vu1ThreadFrame(present("frame2"), false);
+            {
+                std::lock_guard<std::mutex> lock(m);
+                const std::vector<std::string> want = {"gs", "frame1 dispfb1=273"};
+                t.IsTrue(events == want, "frame 2's boundary should return once frame 1 is drawn and presented");
+            }
+            r.mem.vu1ThreadWait(Vu1Thread::kWaitFrame);
+            {
+                std::lock_guard<std::mutex> lock(m);
+                const std::vector<std::string> want = {"gs", "frame1 dispfb1=273", "gs", "frame2 dispfb1=546"};
+                t.IsTrue(events == want, "each frame should be presented with its own display registers, in order");
+                t.IsTrue(presentsOnWorker, "pipelined presents should run on the worker");
+            }
+            t.Equals(r.mem.read64(0x12000070u), static_cast<uint64_t>(0x222u), "a DISPFB1 read should drain and see the last write");
+            r.mem.stopVu1Thread();
+        });
+
+        tc.Run("pipelined frames: CSR reads do not wait and do not depend on the worker's progress", [](TestCase &t)
+        {
+            Rig r(true);
+            r.mem.m_vu1Pipeline = true;
+            r.arbiter.setPathPacketFn([&](GifPathId, const uint8_t *, uint32_t, bool)
+                                      {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                r.mem.gs().csr.fetch_or(0x2u); });       // FINISH, as the GS front end raises it
+            std::vector<uint8_t> s;
+            put32(s, vifCmd(0x14u, 0u, 0u));
+            r.mem.processVIF1Data(s.data(), static_cast<uint32_t>(s.size()));
+            r.mem.vu1ThreadFrame([] {}, false); // frame 1
+            r.mem.gs().csr.fetch_or(0x2000u);   // FIELD, as the EE scheduler sets it at VBlank
+            uint64_t csr = r.mem.read64(0x12001000u);
+            t.IsTrue((csr & 0x2000u) != 0u, "FIELD should be current");
+            t.IsTrue((csr & 0x2u) == 0u, "FINISH from frame 1's packets should not show before frame 1's boundary has passed");
+            r.mem.vu1ThreadFrame([] {}, false); // frame 2: waits for frame 1
+            csr = r.mem.read64(0x12001000u);
+            t.IsTrue((csr & 0x2u) != 0u, "FINISH should show once frame 1's boundary has passed");
+            t.Equals(r.mem.read32(0x12001000u), static_cast<uint32_t>(csr), "read32 should agree with read64");
+            r.mem.write64(0x12001000u, 0x2u); // clear FINISH
+            t.IsTrue((r.mem.read64(0x12001000u) & 0x2u) == 0u, "the EE's own clear should show at once");
+            r.mem.vu1ThreadFrame([] {}, false); // frame 3: frame 2's snapshot still had FINISH, before the clear
+            t.IsTrue((r.mem.read64(0x12001000u) & 0x2u) == 0u, "the clear should stay visible across the next boundary");
+            r.mem.vu1ThreadWait(Vu1Thread::kWaitFrame);
+            t.IsTrue((r.mem.gs().csr.load() & 0x2u) == 0u, "the worker should have applied the clear");
+            t.IsTrue(r.mem.vu1ThreadPipelined(), "a few CSR reads should keep the pipeline on");
+            r.mem.noteVBlank();
+            for (uint32_t i = 0; i < 64u; ++i)
+                r.mem.read32(0x12001000u);
+            t.IsTrue(r.mem.vu1ThreadPipelined(), "64 CSR reads in one VBlank should keep the pipeline on");
+            r.mem.noteVBlank();
+            for (uint32_t i = 0; i < 64u; ++i)
+                r.mem.read32(0x12001000u);
+            t.IsTrue(r.mem.vu1ThreadPipelined(), "the count should restart at each VBlank");
+            r.mem.read32(0x12001000u);
+            t.IsTrue(!r.mem.vu1ThreadPipelined(), "polling CSR should turn the pipeline off");
+            bool ranNow = false;
+            r.mem.vu1ThreadFrame([&] { ranNow = !Vu1Thread::onWorker(); }, false);
+            t.IsTrue(ranNow, "after that, frames should be presented on the game thread after a full drain");
+        });
+
+        tc.Run("pipelined frames: an exact frame drains and presents on the game thread", [](TestCase &t)
+        {
+            std::atomic<bool> gsDone{false};
+            Rig r(true);
+            r.mem.m_vu1Pipeline = true;
+            r.arbiter.setPathPacketFn([&](GifPathId, const uint8_t *, uint32_t, bool)
+                                      {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                gsDone = true; });
+            std::vector<uint8_t> s;
+            put32(s, vifCmd(0x14u, 0u, 0u));
+            r.mem.processVIF1Data(s.data(), static_cast<uint32_t>(s.size()));
+            bool sawGs = false, onGame = false;
+            r.mem.vu1ThreadFrame([&] { sawGs = gsDone.load(); onGame = !Vu1Thread::onWorker(); }, true);
+            t.IsTrue(sawGs && onGame, "a capture frame should be presented on the game thread with its GS work done");
         });
 
         tc.Run("PATH3 packets released by MSKPATH3 follow the VIF1 stream", [](TestCase &t)
