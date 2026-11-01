@@ -1,6 +1,7 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -128,7 +129,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_L2);
         if (IsKeyDown(KEY_RIGHT_SHIFT))
             clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
+        // Alt+Enter switches the window mode (ps2_runtime.cpp), so an Enter pressed with Alt held is not Start
+        // until it is released.
+        static std::atomic<bool> enterIsWindowToggle{false};
+        const bool enterDown = IsKeyDown(KEY_ENTER);
+        if (!enterDown)
+            enterIsWindowToggle.store(false, std::memory_order_relaxed);
+        else if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
+            enterIsWindowToggle.store(true, std::memory_order_relaxed);
+        if (enterDown && !enterIsWindowToggle.load(std::memory_order_relaxed))
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
