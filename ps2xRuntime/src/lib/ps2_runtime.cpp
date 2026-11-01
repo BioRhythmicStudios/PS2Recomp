@@ -1775,6 +1775,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
+    if (m_eeScheduler && m_eeScheduler->transferPending())
+    {
+        return false; // the thread was switched out inside a syscall stub; $pc is where it resumes
+    }
+
     if (isStopRequested() || ctx->pc == 0u)
     {
         return false;
@@ -1845,6 +1850,33 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
     const uint32_t syscallId = (encodedSyscallId != 0u)
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
+
+    // ctx->pc already holds the instruction after the syscall. When that is `jr $ra` (a libkernel stub), a thread
+    // switch the syscall requests can return instead of unwinding (EeScheduler::setSyscallReturnsDirectly).
+    static const bool lazySwitch = []
+    {
+        const char *env = std::getenv("PS2X_EE_LAZY_SWITCH");
+        return !env || std::strcmp(env, "0") != 0;
+    }();
+    struct StubScope
+    {
+        EeScheduler *scheduler;
+        ~StubScope()
+        {
+            if (scheduler)
+                scheduler->setSyscallReturnsDirectly(false);
+        }
+    } stubScope{nullptr};
+    if (lazySwitch && m_eeScheduler)
+    {
+        uint32_t next = 0;
+        std::memcpy(&next, rdram + (ctx->pc & PS2_RAM_MASK), sizeof(next));
+        if (next == 0x03E00008u) // jr $ra
+        {
+            m_eeScheduler->setSyscallReturnsDirectly(true);
+            stubScope.scheduler = m_eeScheduler.get();
+        }
+    }
 
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
