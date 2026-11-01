@@ -164,7 +164,15 @@ namespace ps2_stubs
             setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
             setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
 
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
+            // Alt+Enter switches the window mode (ps2_runtime.cpp), so an Enter pressed with Alt held is not Start
+            // until it is released.
+            static std::atomic<bool> enterIsWindowToggle{false};
+            const bool enterDown = IsKeyDown(KEY_ENTER);
+            if (!enterDown)
+                enterIsWindowToggle.store(false, std::memory_order_relaxed);
+            else if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
+                enterIsWindowToggle.store(true, std::memory_order_relaxed);
+            setButton(state, kPadBtnStart, enterDown && !enterIsWindowToggle.load(std::memory_order_relaxed));
             setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
             setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
             setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
