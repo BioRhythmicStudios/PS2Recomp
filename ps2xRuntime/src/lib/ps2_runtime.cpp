@@ -13,6 +13,7 @@
 #include "runtime/ps2_exit_reason.h"
 #include "runtime/ps2_vu1_overlap_model.h"
 #include "runtime/ps2_vu1_thread.h"
+#include "runtime/ps2_display_aspect.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -1144,7 +1145,9 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // A 16:9 game mode (ps2_display_aspect.h) opens a 16:9 window of the same height.
+        InitWindow(ps2_display_aspect::isWideEnabled() ? HOST_WINDOW_HEIGHT * 16 / 9 : HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT,
+                   title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -3061,6 +3064,11 @@ void PS2Runtime::run()
     UnloadImage(blank);
 
     WindowMode windowMode;
+    // 16:9 while the game keeps reporting widescreen frames (ps2_display_aspect.h); kWideHold presents (about 0.2 s)
+    // without one fall back to 4:3, so movies and 2D-only screens keep their shape.
+    constexpr int kWideHold = 10;
+    uint64_t lastWideFrames = ps2_display_aspect::wideFrameCount();
+    int presentsSinceWide = kWideHold;
     windowMode.start();
 
     // PS2X_GS_THREAD=1: GS work runs on its own thread (GS_THREADING_PLAN.md). Headless runs stay inline.
@@ -3199,10 +3207,25 @@ void PS2Runtime::run()
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         // The GS drives a 4:3 TV picture whatever the buffer's pixel count (640x448 NTSC, 640x512 PAL),
-        // so fit a 4:3 rectangle rather than assuming square pixels.
-        constexpr float kDisplayAspect = 4.0f / 3.0f;
-        const float dstHeight = std::min(screenHeight, screenWidth / kDisplayAspect);
-        const float dstWidth = dstHeight * kDisplayAspect;
+        // so fit a 4:3 rectangle rather than assuming square pixels. A widescreen game mode draws its 3D view
+        // anamorphically into the same buffer, shown at 16:9.
+        float displayAspect = 4.0f / 3.0f;
+        if (ps2_display_aspect::isWideEnabled())
+        {
+            const uint64_t wideFrames = ps2_display_aspect::wideFrameCount();
+            presentsSinceWide = wideFrames != lastWideFrames ? 0 : std::min(presentsSinceWide + 1, kWideHold);
+            lastWideFrames = wideFrames;
+            if (presentsSinceWide < kWideHold)
+                displayAspect = 16.0f / 9.0f;
+            static float loggedAspect = 0.0f;
+            if (displayAspect != loggedAspect)
+            {
+                loggedAspect = displayAspect;
+                RUNTIME_LOG("[run] presentation aspect " << (displayAspect > 1.5f ? "16:9" : "4:3"));
+            }
+        }
+        const float dstHeight = std::min(screenHeight, screenWidth / displayAspect);
+        const float dstWidth = dstHeight * displayAspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
