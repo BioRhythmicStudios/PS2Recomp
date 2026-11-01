@@ -323,6 +323,8 @@ public:
     bool writeIopMemory(uint32_t address, const void *source, size_t size);
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;
+    // An EE sceSdRemote call (LIBSD, SID 0x80000701) run by the emulated IOP's libsd and SPU2; false if unsupported.
+    bool iopSdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -570,7 +572,7 @@ private:
     // when it has (or before any other call into the IOP), which leaves it in the same state at a fraction of the cost.
     void advanceIopEeCycles(uint64_t eeCycles) noexcept
     {
-        if (m_iopAudioClock == IopAudioClock::RealTime && m_iopAudioPlayback)
+        if (iopOnRealTimeClock())
         {
             m_iopRealTimeEeCycles += eeCycles;
             if (m_iopRealTimeEeCycles >= kIopRealTimeTickEeCycles)
@@ -583,6 +585,14 @@ private:
     }
     void runIopUntilIdle() noexcept;
     void runHeldIopCycles() noexcept;
+    // The RealTime clock is in effect, unless the SPU2 plays a stream the EE feeds (the movie soundtrack through the
+    // sound data input): the EE writes that stream as it plays, so the IOP then follows EE time as in Lockstep, and
+    // the audio device paces the EE, which keeps picture and sound together when the EE falls behind.
+    [[nodiscard]] bool iopOnRealTimeClock() const noexcept
+    {
+        return m_iopAudioClock == IopAudioClock::RealTime && m_iopAudioPlayback && !m_iopGuestFedAudio;
+    }
+    void setIopGuestFedAudio(bool fed) noexcept;
     // RealTime clock: brings the IOP up to the audio device (or, while the device is not consuming, hands it the EE
     // cycles since the previous update).
     void runIopRealTime() noexcept;
@@ -606,6 +616,7 @@ private:
     uint64_t m_iopIdleEeCycles = 0;  // the IOP has nothing due before it is handed this many
     IopAudioClock m_iopAudioClock = IopAudioClock::Lockstep;
     uint64_t m_iopRealTimeEeCycles = 0;   // EE cycles since the last RealTime update
+    bool m_iopGuestFedAudio = false;       // the SPU2's sound data input is running (see iopOnRealTimeClock)
     bool m_iopRealTimeAnchored = false;   // the anchor below is valid
     uint64_t m_iopRealTimeAnchorCycle = 0; // IOP cycle at which the ring had been handed m_iopRealTimeAnchorFrame frames
     uint64_t m_iopRealTimeAnchorFrame = 0;

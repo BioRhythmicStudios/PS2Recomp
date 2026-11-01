@@ -45,6 +45,7 @@ namespace ps2x::iop::detail
 
         // MMIX gates.
         constexpr uint16_t kMixExtWetR = 0x001u, kMixExtWetL = 0x002u, kMixExtDryR = 0x004u, kMixExtDryL = 0x008u;
+        constexpr uint16_t kMixInWetR = 0x010u, kMixInWetL = 0x020u, kMixInDryR = 0x040u, kMixInDryL = 0x080u;
         constexpr uint16_t kMixSndWetR = 0x100u, kMixSndWetL = 0x200u, kMixSndDryR = 0x400u, kMixSndDryL = 0x800u;
 
         // ADPCM block flags.
@@ -261,6 +262,20 @@ namespace ps2x::iop::detail
         m_regs.fill(0u);
         for (Core &core : m_cores)
             core = Core{};
+    }
+
+    void IopSpu2::startInput(uint32_t core)
+    {
+        Core &c = m_cores[core & 1u];
+        c.inputRunning = true;
+        c.inputFrame = InputBlockFrames;
+    }
+
+    void IopSpu2::stopInput(uint32_t core)
+    {
+        Core &c = m_cores[core & 1u];
+        c.inputRunning = false;
+        c.inputFrame = InputBlockFrames;
     }
 
     uint32_t IopSpu2::activeVoices() const noexcept
@@ -667,14 +682,35 @@ namespace ps2x::iop::detail
             if (core.vmixer & bit) wetRight += right;
         }
 
+        int32_t inputLeft = 0, inputRight = 0;
+        if (core.inputRunning)
+        {
+            if (core.inputFrame >= InputBlockFrames)
+            {
+                core.inputFrame = 0u;
+                if (!m_inputFetch || !m_inputFetch(coreIndex, core.inputBlock.data()))
+                {
+                    core.inputRunning = false;
+                    core.inputBlock.fill(0);
+                }
+            }
+            inputLeft = (core.inputBlock[core.inputFrame] * core.inputLeft) >> 15;
+            inputRight = (core.inputBlock[InputBlockFrames + core.inputFrame] * core.inputRight) >> 15;
+            ++core.inputFrame;
+        }
+
         const uint16_t mmix = core.mmix;
-        int32_t left = ((mmix & kMixSndDryL) ? dryLeft : 0) + ((mmix & kMixExtDryL) ? externalLeft : 0);
-        int32_t right = ((mmix & kMixSndDryR) ? dryRight : 0) + ((mmix & kMixExtDryR) ? externalRight : 0);
+        int32_t left = ((mmix & kMixSndDryL) ? dryLeft : 0) + ((mmix & kMixExtDryL) ? externalLeft : 0) +
+                       ((mmix & kMixInDryL) ? inputLeft : 0);
+        int32_t right = ((mmix & kMixSndDryR) ? dryRight : 0) + ((mmix & kMixExtDryR) ? externalRight : 0) +
+                        ((mmix & kMixInDryR) ? inputRight : 0);
         // The wet path feeds the reverb, which is not emulated yet: its output is silence.
         (void)kMixSndWetL;
         (void)kMixSndWetR;
         (void)kMixExtWetL;
         (void)kMixExtWetR;
+        (void)kMixInWetL;
+        (void)kMixInWetR;
         (void)wetLeft;
         (void)wetRight;
         outLeft = clamp16(left);

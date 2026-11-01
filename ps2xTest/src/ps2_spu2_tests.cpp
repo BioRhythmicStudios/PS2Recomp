@@ -7,6 +7,7 @@
 #include "emulator/spu2/iop_spu2.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <optional>
 #include <vector>
@@ -325,6 +326,82 @@ void register_ps2_spu2_tests()
             t.Equals(iop.emulatorCycles(), served + 1000u, "the clock continues from the served time");
             iop.runEeCycles(8u * 500u);
             t.Equals(iop.emulatorCycles(), served + 1500u, "EE cycles granted afterwards add on");
+        });
+
+        tc.Run("sceSdRemote block transfers stream 1 KiB blocks, loop and report the buffer half", [](TestCase &t)
+        {
+            Libsd sd;
+            uint32_t result = 0xFFu;
+            t.IsTrue(sd.libsd.remote(0x8000u, {0u}, result) && result == 0u, "rSdInit(0)");
+            t.IsTrue(!sd.libsd.remote(0x8090u, {}, result), "an unsupported remote function is refused");
+
+            std::array<int16_t, 1024> ring{}; // two blocks: 256 left then 256 right samples each
+            for (size_t i = 0; i < 256u; ++i)
+            {
+                ring[i] = 1000;
+                ring[256u + i] = -1000;
+                ring[512u + i] = 2000;
+                ring[768u + i] = -2000;
+            }
+            t.IsTrue(sd.memory.writeRam(0x20000u, ring.data(), sizeof(ring)), "stage the ring in IOP RAM");
+
+            t.IsTrue(sd.libsd.remote(0x80E0u, {0u, 0x13u, 0x20000u, 0x800u, 0x20400u}, result) && result == 0u,
+                     "a looping write-from transfer starts");
+            t.Equals(sd.libsd.remote(0x8100u, {0u}, result) ? result : 0u, (1u << 24u) | 0x20400u,
+                     "write-from starts at the block holding `start`, in the second half");
+            int16_t block[512];
+            t.IsTrue(sd.libsd.fetchInputBlock(0u, block) && block[0] == 2000 && block[256] == -2000,
+                     "the first block read is the second ring block");
+            t.Equals(sd.libsd.remote(0x8100u, {0u}, result) ? result : 0u, 0x20000u, "the ring wraps to its start");
+            t.IsTrue(sd.libsd.fetchInputBlock(0u, block) && block[0] == 1000 && block[511] == -1000,
+                     "a looping transfer reads the first block again");
+            t.Equals(static_cast<int>(sd.libsd.inputBlocks()), 2, "two blocks read");
+
+            t.IsTrue(sd.libsd.remote(0x80E0u, {0u, 2u, 0u, 0u, 0u}, result), "stop the transfer");
+            t.Equals(result, (1u << 24u) | 0x20400u, "stop returns the last status");
+            t.IsTrue(!sd.libsd.fetchInputBlock(0u, block), "a stopped transfer gives no more blocks");
+
+            t.IsTrue(sd.libsd.remote(0x80E0u, {1u, 0u, 0x20000u, 0x800u, 0u}, result) && result == 0u,
+                     "a one-shot write transfer starts on core 1");
+            t.IsTrue(sd.libsd.fetchInputBlock(1u, block) && sd.libsd.fetchInputBlock(1u, block) && block[0] == 2000,
+                     "a one-shot transfer reads both blocks");
+            t.IsTrue(!sd.libsd.fetchInputBlock(1u, block), "and then ends");
+            t.IsTrue(sd.libsd.remote(0x80E0u, {0u, 0x10u, 0x20000u, 0x900u, 0u}, result) && result == 0xFFFFFFFFu,
+                     "a size that is not a multiple of 1 KiB is refused");
+        });
+
+        tc.Run("the sound data input plays through BVOL", [](TestCase &t)
+        {
+            auto play = [](uint32_t bvol, std::vector<int16_t> &out)
+            {
+                Libsd sd;
+                sd.spu2.setInputFetch([&sd](uint32_t core, int16_t block[512])
+                                      { return sd.libsd.fetchInputBlock(core, block); });
+                uint32_t result = 0u;
+                (void)sd.libsd.remote(0x8000u, {0u}, result);
+                for (uint32_t entry : {0x0980u, 0x0A80u, 0x0981u, 0x0A81u}) // MVOL L/R of both cores
+                    (void)sd.libsd.remote(0x8010u, {entry, 0x3FFFu}, result);
+                (void)sd.libsd.remote(0x8010u, {0x0F80u, bvol}, result); // BVOLL core 0
+                (void)sd.libsd.remote(0x8010u, {0x1080u, bvol}, result); // BVOLR core 0
+                std::array<int16_t, 512> ring{};
+                for (size_t i = 0; i < 256u; ++i)
+                {
+                    ring[i] = 8000;
+                    ring[256u + i] = -8000;
+                }
+                (void)sd.memory.writeRam(0x20000u, ring.data(), sizeof(ring));
+                (void)sd.libsd.remote(0x80E0u, {0u, 0x10u, 0x20000u, 0x400u, 0u}, result);
+                sd.spu2.run(1024u, out);
+                return sd.spu2.inputRunning(0u);
+            };
+            std::vector<int16_t> out;
+            t.IsTrue(play(0x7FFFu, out), "a looping input keeps running");
+            t.IsTrue(*std::max_element(out.begin(), out.end()) > 2000, "the left channel plays the input");
+            t.IsTrue(*std::min_element(out.begin(), out.end()) < -2000, "the right channel plays the input");
+            std::vector<int16_t> muted;
+            (void)play(0u, muted);
+            t.IsTrue(std::all_of(muted.begin(), muted.end(), [](int16_t s) { return s == 0; }),
+                     "BVOL 0 silences the input");
         });
 
         tc.Run("IRX modules start with argc and argv", [](TestCase &t)

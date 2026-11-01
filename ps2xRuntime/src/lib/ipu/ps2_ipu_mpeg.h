@@ -52,17 +52,24 @@ namespace ps2_ipu
         uint64_t available() const { return m_buf.size() * 8u - m_pos; }
         uint64_t position() const { return m_pos; }
         void setPosition(uint64_t pos) { m_pos = pos; }
+        // Asks for input until n bits are buffered; false (without throwing) when it runs out first.
+        bool tryEnsure(unsigned n)
+        {
+            while (m_pos + n > m_buf.size() * 8u)
+            {
+                if (!more())
+                    return false;
+            }
+            return true;
+        }
 
     protected:
         // Appends input to m_buf; returns false when nothing more is available right now.
         virtual bool more() = 0;
         void ensure(unsigned n)
         {
-            while (m_pos + n > m_buf.size() * 8u)
-            {
-                if (!more())
-                    throw IpuStarved{};
-            }
+            if (!tryEnsure(n))
+                throw IpuStarved{};
         }
 
         std::vector<uint8_t> m_buf;

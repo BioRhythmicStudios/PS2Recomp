@@ -3,6 +3,7 @@
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
 
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -40,6 +41,12 @@ namespace ps2x::iop
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         void onSifTransfer(const SifTransfer &transfer);
+        // The EE's sceSdRemote calls (LIBSD's RPC server, SID 0x80000701), run by the emulated IOP's libsd and SPU2:
+        // `function` is the remote function number (0x8000 rSdInit ...), `args` the packet's argument words. False if
+        // the function is not supported (or the emulated sound library has not been initialised).
+        [[nodiscard]] bool sdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result);
+        // The SPU2 is playing a sound data input stream (a block transfer).
+        [[nodiscard]] bool soundInputRunning() const noexcept;
 
         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);

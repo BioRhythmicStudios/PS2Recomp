@@ -370,6 +370,16 @@ namespace
         RotateThreadReadyQueue(rdram, ctx, runtime);
     }
 
+    void schedulerRotateAlone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(10);
+        ctx->pc = K_SCHED_A_RESUME;
+        setRegU32(*ctx, 4, 5u);
+        RotateThreadReadyQueue(rdram, ctx, runtime);
+        // Reached only when the rotation returns instead of transferring to the dispatcher.
+        gSchedulerTrace->push_back(getRegS32(*ctx, 2) == KE_OK ? 12 : -12);
+    }
+
     void schedulerRotateAResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         gSchedulerTrace->push_back(11);
@@ -831,6 +841,26 @@ void register_ps2_runtime_kernel_tests()
 
             const std::vector<int> expected{1, 10, 20, 11};
             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
+        });
+
+        tc.Run("RotateThreadReadyQueue with no peer keeps the caller running", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SCHED_A, schedulerRotateAlone);
+            env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRotateAResume);
+            env.ctx.pc = K_SCHED_MAIN;
+
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int alone = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+            ee.startThread(alone, 0, env.ctx, false);
+            ee.run();
+
+            const std::vector<int> expected{1, 10, 12, 11};
+            t.IsTrue(trace == expected, "a rotation that would reselect the caller should return to it directly");
         });
 
         tc.Run("starting a strictly higher-priority thread preempts immediately", [](TestCase &t)

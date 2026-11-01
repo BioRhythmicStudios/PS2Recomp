@@ -299,6 +299,15 @@ public:
     int rotateReadyQueue(int priority, bool interruptSafe);
     int releaseWait(int id, bool interruptSafe);
     void transferIfRequested(bool interruptSafe);
+    // A thread switch normally unwinds the switched-out thread's host stack with EeDispatcherTransfer. Inside a
+    // libkernel syscall stub (`syscall` followed by `jr $ra`) nothing of the thread's own code runs between the
+    // syscall and its return, so the switch can instead be made by returning: transferIfRequested() leaves the
+    // switch pending, the stub returns with $pc at the caller's return address, every dispatchGuestBranch() on the
+    // way out returns false while transferPending(), and the run loop selects the next thread. The thread resumes
+    // at that return address, exactly where the unwind would have resumed it. The opening movie's two decoder
+    // threads yield to each other ~140k times a second; each unwind costs microseconds.
+    void setSyscallReturnsDirectly(bool returnsDirectly) noexcept { m_syscallReturnsDirectly = returnsDirectly; }
+    [[nodiscard]] bool transferPending() const noexcept { return m_transferPending; }
 
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
@@ -368,7 +377,10 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    // Marks the snapshot stale. The run loop republishes it every kDebugPublishDispatchInterval dispatches, before
+    // an idle wait and when it stops: building it on every kernel call cost the FMV player about a tenth of its time.
     void publishSnapshot();
+    void publishSnapshotNow();
 
 private:
     struct ScheduledEvent
@@ -435,6 +447,8 @@ private:
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
+    bool m_syscallReturnsDirectly = false; // the syscall being handled is a stub's: a switch may return
+    bool m_transferPending = false;        // a switch is being made by returning to the run loop
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
@@ -469,4 +483,5 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    bool m_snapshotStale = false;
 };

@@ -3,6 +3,7 @@
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -30,6 +31,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
+        // An EE sceSdRemote call for LIBSD's RPC server (see IopLibsd::remote).
+        [[nodiscard]] bool sdRemote(uint32_t function, const std::array<uint32_t, 5> &args, uint32_t &result);
+        [[nodiscard]] bool soundInputRunning() const noexcept;
 
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);
