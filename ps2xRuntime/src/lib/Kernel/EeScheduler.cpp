@@ -1393,7 +1393,15 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
 
 void EeScheduler::setVideoMode(bool pal)
 {
-    setVBlankPeriodMicroseconds(pal ? kPalVBlankMicroseconds : kNtscVBlankMicroseconds);
+    m_videoModePeriodMicroseconds = pal ? kPalVBlankMicroseconds : kNtscVBlankMicroseconds;
+    setVBlankPeriodMicroseconds(m_vblankOverrideMicroseconds ? m_vblankOverrideMicroseconds : m_videoModePeriodMicroseconds);
+}
+
+void EeScheduler::setVBlankPeriodOverride(uint32_t microseconds)
+{
+    m_vblankOverrideMicroseconds = microseconds;
+    const uint32_t mode = m_videoModePeriodMicroseconds ? m_videoModePeriodMicroseconds : kNtscVBlankMicroseconds;
+    setVBlankPeriodMicroseconds(microseconds ? microseconds : mode);
 }
 
 void EeScheduler::setVBlankPeriodMicroseconds(uint32_t microseconds)
@@ -2024,6 +2032,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ps2_host_profile::noteVBlank();
+        m_runtime.memory().noteVBlank();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

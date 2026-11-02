@@ -397,25 +397,11 @@ namespace vu1aot
         return _mm_castsi128_ps(result);
     }
 
-    // normalizeExact on four lanes. Masks are in movemask order (bit c = component c).
+    // normalizeExact's classes on four lanes. Masks are in movemask order (bit c = component c).
     struct ExactClass
     {
         uint32_t sign, zero, under, over; // zero excludes underflow
     };
-    inline ExactClass classifyExact(__m256d exact)
-    {
-        const __m256d magnitude = _mm256_and_pd(exact, _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFll)));
-        ExactClass k;
-        k.sign = static_cast<uint32_t>(_mm256_movemask_pd(exact));
-        k.zero = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_setzero_pd(), _CMP_EQ_OQ)));
-        k.over = static_cast<uint32_t>(_mm256_movemask_pd(
-            _mm256_cmp_pd(magnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max())), _CMP_GT_OQ)));
-        k.under = static_cast<uint32_t>(_mm256_movemask_pd(
-                      _mm256_cmp_pd(magnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min())),
-                                    _CMP_LT_OQ))) &
-                  ~k.zero;
-        return k;
-    }
 
     // Movemask order (bit c = component c) to MAC lane order (bit 3 - c).
     inline constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE, 0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
@@ -477,34 +463,57 @@ namespace vu1aot
                 exact = _mm256_blend_pd(exact, _mm256_setzero_pd(), 0x8); // w = 0
         }
 
-        const ExactClass k = classifyExact(exact);
-        // Result: zero/underflow lanes become signed zero, overflow lanes signed FLT_MAX.
+        // Result: zero/underflow lanes become signed zero, overflow lanes signed FLT_MAX. Rounding toward zero (the
+        // VU mode, set while VU1 runs) already gives signed FLT_MAX for an overflow and signed zero for an exact zero,
+        // so only underflow lanes, which round to a denormal, need their magnitude cleared.
         const __m128 rounded = _mm256_cvtpd_ps(exact);
-        alignas(16) static constexpr uint32_t laneMasks[16][4] = {
-            {0, 0, 0, 0}, {~0u, 0, 0, 0}, {0, ~0u, 0, 0}, {~0u, ~0u, 0, 0},
-            {0, 0, ~0u, 0}, {~0u, 0, ~0u, 0}, {0, ~0u, ~0u, 0}, {~0u, ~0u, ~0u, 0},
-            {0, 0, 0, ~0u}, {~0u, 0, 0, ~0u}, {0, ~0u, 0, ~0u}, {~0u, ~0u, 0, ~0u},
-            {0, 0, ~0u, ~0u}, {~0u, 0, ~0u, ~0u}, {0, ~0u, ~0u, ~0u}, {~0u, ~0u, ~0u, ~0u}};
-        const __m128 signBits = _mm_castsi128_ps(_mm_slli_epi32(
-            _mm_load_si128(reinterpret_cast<const __m128i *>(laneMasks[k.sign & 0xFu])), 31));
+        const __m256d magnitude = _mm256_and_pd(exact, _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFll)));
+        const __m256d tinyLanes = _mm256_cmp_pd(magnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min())),
+                                                _CMP_LT_OQ); // zero or underflow
+        const uint32_t tiny = static_cast<uint32_t>(_mm256_movemask_pd(tinyLanes));
         __m128 out = rounded;
-        if ((k.zero | k.under | k.over) != 0u)
+        if ((tiny & destMask) != 0u)
         {
-            out = _mm_blendv_ps(out, signBits, _mm_load_ps(reinterpret_cast<const float *>(laneMasks[k.zero | k.under])));
-            out = _mm_blendv_ps(out, _mm_or_ps(signBits, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF))),
-                                _mm_load_ps(reinterpret_cast<const float *>(laneMasks[k.over])));
+            const __m128 tiny32 = _mm_shuffle_ps(_mm_castpd_ps(_mm256_castpd256_pd128(tinyLanes)),
+                                                 _mm_castpd_ps(_mm256_extractf128_pd(tinyLanes, 1)), _MM_SHUFFLE(2, 0, 2, 0));
+            out = _mm_andnot_ps(_mm_and_ps(tiny32, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), rounded);
         }
         _mm_storeu_ps(r, out);
         if constexpr (dest == 0u)
             return false;
+        ExactClass k;
+        k.sign = static_cast<uint32_t>(_mm256_movemask_pd(exact));
+        k.over = static_cast<uint32_t>(_mm256_movemask_pd(
+            _mm256_cmp_pd(magnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max())), _CMP_GT_OQ)));
+        k.zero = tiny;
+        k.under = 0u;
+        if ((tiny & destMask) != 0u)
+        {
+            k.zero = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_setzero_pd(), _CMP_EQ_OQ)));
+            k.under = tiny & ~k.zero;
+        }
 
         // calculateFmacProductSticky: product conditions of the product-sum forms (all lanes, w included).
         uint32_t extraSticky = 0u;
         if constexpr (u.form == Form::Madd || u.form == Form::Msub || u.form == Form::OpMsub)
         {
-            const ExactClass p = classifyExact(product);
-            extraSticky = ((p.zero | p.under) & destMask ? 0x1u : 0u) | (p.sign & destMask ? 0x2u : 0u) |
-                          (p.under & destMask ? 0x4u : 0u) | (p.over & destMask ? 0x8u : 0u);
+            // As for the result: the zero test is needed only when a DEST lane is below FLT_MIN.
+            const __m256d pMagnitude =
+                _mm256_and_pd(product, _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFll)));
+            const uint32_t pTiny = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(
+                                       pMagnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::min())),
+                                       _CMP_LT_OQ))) &
+                                   destMask;
+            const uint32_t pSign = static_cast<uint32_t>(_mm256_movemask_pd(product)) & destMask;
+            const uint32_t pOver = static_cast<uint32_t>(_mm256_movemask_pd(_mm256_cmp_pd(
+                                       pMagnitude, _mm256_set1_pd(static_cast<double>(std::numeric_limits<float>::max())),
+                                       _CMP_GT_OQ))) &
+                                   destMask;
+            uint32_t pUnder = 0u;
+            if (pTiny != 0u)
+                pUnder = pTiny & ~static_cast<uint32_t>(
+                                     _mm256_movemask_pd(_mm256_cmp_pd(pMagnitude, _mm256_setzero_pd(), _CMP_EQ_OQ)));
+            extraSticky = (pTiny ? 0x1u : 0u) | (pSign ? 0x2u : 0u) | (pUnder ? 0x4u : 0u) | (pOver ? 0x8u : 0u);
         }
 
         // updateFmacFlags (underflow also sets the zero flag).

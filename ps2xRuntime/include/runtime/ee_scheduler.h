@@ -346,6 +346,9 @@ public:
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     // Selects the field rate from the video mode (GsSetCrt): PAL 50 Hz, NTSC 60 Hz.
     void setVideoMode(bool pal);
+    // Host override of the field period in microseconds (a frame-rate option); 0 returns to the video mode's period.
+    // Takes effect from the next VBlankStart that is scheduled. PS2X_VBLANK_HZ still wins. Executor thread only.
+    void setVBlankPeriodOverride(uint32_t microseconds);
     [[nodiscard]] double vblankHz() const noexcept;
     // Guest EE cycles accounted so far (the clock that VBlank and timer events are scheduled on).
     [[nodiscard]] uint64_t currentCycle() const noexcept { return m_eeCycle; }
@@ -468,6 +471,8 @@ private:
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vblankPeriodMicroseconds = 0;
+    uint32_t m_videoModePeriodMicroseconds = 0; // from setVideoMode
+    uint32_t m_vblankOverrideMicroseconds = 0;  // from setVBlankPeriodOverride, 0 = none
     std::chrono::microseconds m_vblankPeriod{0};
     uint64_t m_vblankPeriodCycles = 0;
     uint32_t m_vsyncFlagAddress = 0;

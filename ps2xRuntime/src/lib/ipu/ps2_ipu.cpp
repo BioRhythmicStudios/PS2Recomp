@@ -77,6 +77,18 @@ namespace
         return enabled;
     }
 
+    // PS2_IPU_HASH=1: a running FNV-1a hash of every qword the IPU outputs, logged at power-of-two qword counts, so
+    // two builds can be checked for identical decoding over the same stream.
+    bool hashEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *v = std::getenv("PS2_IPU_HASH");
+            return v && *v && *v != '0';
+        }();
+        return enabled;
+    }
+
     const char *commandName(uint32_t code)
     {
         static const char *names[] = {"BCLR", "IDEC", "BDEC", "VDEC", "FDEC", "SETIQ", "SETVQ", "CSC",
@@ -426,6 +438,16 @@ void Ps2Ipu::pushOutput(const uint8_t *data, uint32_t bytes)
         Qword q{};
         std::memcpy(q.data(), data + off, std::min(16u, bytes - off));
         m_output.push_back(q);
+        if (hashEnabled())
+        {
+            static uint64_t hash = 0xCBF29CE484222325ull, qwords = 0;
+            for (uint8_t byte : q)
+                hash = (hash ^ byte) * 0x100000001B3ull;
+            ++qwords;
+            if ((qwords & (qwords - 1u)) == 0u)
+                std::fprintf(stderr, "[ipu] output hash after %llu qwords: %016llX\n", static_cast<unsigned long long>(qwords),
+                             static_cast<unsigned long long>(hash));
+        }
     }
 }
 

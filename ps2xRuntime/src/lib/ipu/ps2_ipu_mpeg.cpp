@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 
+#include <immintrin.h>
+
 namespace ps2_ipu
 {
     namespace
@@ -505,6 +507,46 @@ namespace ps2_ipu
     }
 
     void macroblockToRgb32(const MacroblockRaw8 &mb, uint32_t th0, uint32_t th1, uint32_t out[256])
+    {
+        // macroblockToRgb32Reference, eight pixels at a time (the same integer arithmetic). Channels are 0..255, so a
+        // signed compare against the thresholds (clamped to 256) is exact.
+        const __m256i k16 = _mm256_set1_epi32(16), k128 = _mm256_set1_epi32(128), k64 = _mm256_set1_epi32(64);
+        const __m256i zero = _mm256_setzero_si256(), max = _mm256_set1_epi32(255);
+        const __m256i t0 = _mm256_set1_epi32(static_cast<int>(std::min<uint32_t>(th0, 256u)));
+        const __m256i t1 = _mm256_set1_epi32(static_cast<int>(std::min<uint32_t>(th1, 256u)));
+        const auto channel = [&](__m256i sum)
+        { return _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(sum, k64), 7), zero), max); };
+        for (int y = 0; y < 16; ++y)
+        {
+            for (int x = 0; x < 16; x += 8)
+            {
+                const __m256i lum = _mm256_mullo_epi32(
+                    _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(&mb.y[y * 16 + x]))), k16),
+                    _mm256_set1_epi32(149));
+                int32_t cbBytes, crBytes;
+                std::memcpy(&cbBytes, &mb.cb[(y >> 1) * 8 + (x >> 1)], 4);
+                std::memcpy(&crBytes, &mb.cr[(y >> 1) * 8 + (x >> 1)], 4);
+                const __m128i cb8 = _mm_cvtsi32_si128(cbBytes), cr8 = _mm_cvtsi32_si128(crBytes);
+                const __m256i cb = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(cb8, cb8)), k128);
+                const __m256i cr = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(cr8, cr8)), k128);
+                const __m256i r = channel(_mm256_add_epi32(lum, _mm256_mullo_epi32(cr, _mm256_set1_epi32(204))));
+                const __m256i g = channel(_mm256_sub_epi32(_mm256_sub_epi32(lum, _mm256_mullo_epi32(cb, _mm256_set1_epi32(50))),
+                                                           _mm256_mullo_epi32(cr, _mm256_set1_epi32(104))));
+                const __m256i b = channel(_mm256_add_epi32(lum, _mm256_mullo_epi32(cb, _mm256_set1_epi32(258))));
+                const __m256i below0 = _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(t0, r), _mm256_cmpgt_epi32(t0, g)),
+                                                        _mm256_cmpgt_epi32(t0, b));
+                const __m256i below1 = _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(t1, r), _mm256_cmpgt_epi32(t1, g)),
+                                                        _mm256_cmpgt_epi32(t1, b));
+                // Alpha 0x80, or 0x40 below TH1; below TH0 the whole pixel is 0.
+                const __m256i alpha = _mm256_blendv_epi8(_mm256_set1_epi32(0x80000000), _mm256_set1_epi32(0x40000000), below1);
+                const __m256i pixel = _mm256_or_si256(_mm256_or_si256(r, _mm256_slli_epi32(g, 8)),
+                                                      _mm256_or_si256(_mm256_slli_epi32(b, 16), alpha));
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out[y * 16 + x]), _mm256_andnot_si256(below0, pixel));
+            }
+        }
+    }
+
+    void macroblockToRgb32Reference(const MacroblockRaw8 &mb, uint32_t th0, uint32_t th1, uint32_t out[256])
     {
         // BT.601 with the IPU's 7-bit fixed-point coefficients.
         for (int y = 0; y < 16; ++y)

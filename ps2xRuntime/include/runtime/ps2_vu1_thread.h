@@ -34,6 +34,10 @@ public:
         kGif,          // a GIF packet: a = path | directHl << 8 | syntheticImageTag << 9 (payload = the bytes)
         kGifDrain,     // GifArbiter::drain()
         kVif1Check,    // PS2X_VU1_THREAD_CHECK: the game thread's VIF1 parse state after the preceding stretch
+        kGsPriv,       // pipelined frames: an EE write to a GS privileged register, a = address, b = byte width
+                       // (4 or 8), payload = the 64-bit value
+        kCsrClear,     // pipelined frames: the write-one-to-clear CSR bits (SIGNAL, FINISH) an EE write set, in b
+        kFrame,        // pipelined frames: a frame boundary (appendFrame)
     };
 
     struct Record
@@ -139,6 +143,70 @@ public:
             m_error = nullptr;
             std::rethrow_exception(error);
         }
+    }
+
+    // Pipelined frames (PS2X_VU1_PIPELINE=1). The game thread appends a frame boundary with the work that presents
+    // the frame (run on the worker once everything before it is applied) and then waits only for the previous
+    // boundary, so the worker draws frame N while the game builds frame N+1. Returns the frame's sequence number.
+    uint64_t appendFrame(std::function<void()> present)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_frameFns.push_back(std::move(present));
+        }
+        const uint64_t seq = ++m_framesAppended;
+        append(kFrame, static_cast<uint32_t>(seq), 0u);
+        publish();
+        return seq;
+    }
+
+    // Blocks until the worker has passed frame boundary `seq` (0: returns at once) and returns the CSR SIGNAL and
+    // FINISH bits it saw there. Rethrows a worker exception.
+    uint32_t waitFrame(uint64_t seq)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        ++m_waits[kWaitFrame];
+        if (m_framesDone < seq && !m_error)
+        {
+            ps2_host_profile::Scope profileScope(ps2_host_profile::kVu1Wait);
+            const uint64_t start = ps2_host_profile::nowNs();
+            m_eeWaiting = true;
+            m_cvIdle.wait(lock, [&]
+                          { return m_framesDone >= seq || m_error; });
+            m_eeWaiting = false;
+            ++m_waitsBlocked[kWaitFrame];
+            m_waitNs[kWaitFrame] += ps2_host_profile::nowNs() - start;
+        }
+        if (m_error)
+        {
+            std::exception_ptr error = m_error;
+            m_error = nullptr;
+            std::rethrow_exception(error);
+        }
+        return seq == 0 ? 0u : m_frameCsr[seq % kFrameCsrSlots];
+    }
+
+    // Worker, for a kFrame record: presents the frame, then records the boundary as passed with `csrBits`.
+    void runFrame(uint64_t seq, const std::function<uint32_t()> &csrBits)
+    {
+        std::function<void()> present;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_frameFns.empty())
+            {
+                present = std::move(m_frameFns.front());
+                m_frameFns.pop_front();
+            }
+        }
+        if (present)
+            present();
+        const uint32_t bits = csrBits();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_frameCsr[seq % kFrameCsrSlots] = bits;
+            m_framesDone = seq;
+        }
+        m_cvIdle.notify_one();
     }
 
     void noteFallback(WaitReason reason)
@@ -329,6 +397,7 @@ private:
     std::thread m_thread;
 
     // Game thread only.
+    uint64_t m_framesAppended = 0;
     std::vector<uint8_t> m_batch;
     uint64_t m_batchRecords = 0;
     uint64_t m_lastReportNs = 0;
@@ -337,6 +406,10 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_cvWork, m_cvIdle;
     std::deque<std::vector<uint8_t>> m_pending;
+    static constexpr uint64_t kFrameCsrSlots = 4u; // the game thread waits for frame N-1 after appending frame N
+    std::deque<std::function<void()>> m_frameFns;
+    uint64_t m_framesDone = 0;
+    uint32_t m_frameCsr[kFrameCsrSlots] = {};
     std::vector<std::vector<uint8_t>> m_free;
     bool m_busy = false, m_stop = false, m_workerSleeping = false, m_eeWaiting = false;
     std::exception_ptr m_error;
