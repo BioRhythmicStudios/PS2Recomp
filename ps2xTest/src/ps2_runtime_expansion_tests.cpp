@@ -1527,6 +1527,35 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(ok, errors.empty() ? "table check" : errors.front());
         });
 
+        tc.Run("IPU vectorised CSC gives exactly the scalar reference", [](TestCase &t)
+        {
+            uint32_t seed = 0x13579BDu;
+            auto next = [&seed]()
+            {
+                seed = seed * 1103515245u + 12345u;
+                return seed >> 8;
+            };
+            static const uint32_t thresholds[][2] = {{0u, 0u}, {0x20u, 0x60u}, {0x100u, 0x100u}, {0x1FFu, 0x1FFu},
+                                                     {0x80u, 0x40u}, {1u, 2u}};
+            uint32_t mismatches = 0;
+            for (uint32_t iteration = 0; iteration < 3000u; ++iteration)
+            {
+                ps2_ipu::MacroblockRaw8 mb;
+                for (uint8_t &v : mb.y)
+                    v = static_cast<uint8_t>(next());
+                for (uint8_t &v : mb.cb)
+                    v = static_cast<uint8_t>(iteration % 7u == 0u ? (next() & 1u) * 255u : next());
+                for (uint8_t &v : mb.cr)
+                    v = static_cast<uint8_t>(next());
+                const uint32_t *th = thresholds[iteration % (sizeof(thresholds) / sizeof(thresholds[0]))];
+                uint32_t fast[256], reference[256];
+                ps2_ipu::macroblockToRgb32(mb, th[0], th[1], fast);
+                ps2_ipu::macroblockToRgb32Reference(mb, th[0], th[1], reference);
+                mismatches += std::memcmp(fast, reference, sizeof(fast)) != 0 ? 1u : 0u;
+            }
+            t.Equals(mismatches, 0u, "every macroblock should match the scalar CSC bit for bit");
+        });
+
         tc.Run("IPU_CTRL RST self-clears so read-modify-writes keep the FIFO", [](TestCase &t)
         {
             PS2Memory mem;

@@ -146,6 +146,8 @@ namespace ps2_ipu
 
     // CSC: RAW8 macroblock to 256 RGBA32 pixels (R in the low byte), alpha from TH0/TH1.
     void macroblockToRgb32(const MacroblockRaw8 &mb, uint32_t th0, uint32_t th1, uint32_t out[256]);
+    // The plain scalar definition; a test checks that macroblockToRgb32 gives exactly its results.
+    void macroblockToRgb32Reference(const MacroblockRaw8 &mb, uint32_t th0, uint32_t th1, uint32_t out[256]);
     // RGBA32 to RGB16 (A1B5G5R5), optionally dithered.
     void rgb32ToRgb16(const uint32_t in[256], bool dither, uint16_t out[256]);
 
