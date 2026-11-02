@@ -491,6 +491,7 @@ public:
 
     // GS register accessors
     GSRegisters &gs() { return gs_regs; }
+    Ps2Ipu &ipu() { return *m_ipu; }
     const GSRegisters &gs() const { return gs_regs; }
     uint8_t *getGSVRAM() { return m_gsVRAM; }
     const uint8_t *getGSVRAM() const { return m_gsVRAM; }

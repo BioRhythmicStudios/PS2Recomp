@@ -34,6 +34,12 @@ namespace ps2_ipu
         }
         uint32_t qwords() const { return static_cast<uint32_t>(m_buf.size() / 16u); }
         uint32_t bitPointer() const { return static_cast<uint32_t>(m_pos & 127u); }
+        // Whole bytes buffered from the current position (rounded down to a byte) on, and where they start.
+        uint32_t bufferedBytes() const
+        {
+            return static_cast<uint32_t>(m_buf.size() - std::min<size_t>(m_buf.size(), static_cast<size_t>(m_pos >> 3)));
+        }
+        const uint8_t *bytes() const { return m_buf.data() + (m_pos >> 3); }
 
     protected:
         bool more() override
@@ -407,6 +413,25 @@ void Ps2Ipu::fillInput()
         m_bits->append(q.data());
         m_topValid = false;
     }
+}
+
+uint32_t Ps2Ipu::peekInput(uint8_t *out, uint32_t max)
+{
+    if (m_busy)
+        return 0u;
+    fillInput();
+    const uint32_t n = std::min(max, m_bits->bufferedBytes());
+    if (n != 0u)
+        std::memcpy(out, m_bits->bytes(), n);
+    return n;
+}
+
+void Ps2Ipu::skipInput(uint32_t n)
+{
+    m_bits->setPosition(((m_bits->position() >> 3) + std::min(n, m_bits->bufferedBytes())) << 3);
+    m_bits->compact();
+    m_topValid = false;
+    fillInput();
 }
 
 void Ps2Ipu::drainOutput()
