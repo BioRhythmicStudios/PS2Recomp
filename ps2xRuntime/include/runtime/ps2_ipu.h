@@ -47,6 +47,13 @@ public:
     // Called after the EE wrote CHCR of channel 3 or 4 (the value is already in the IO registers).
     void dmaControlWritten(uint32_t channelBase);
 
+    // Byte access to the input stream for a host MPEG decoder that stands in for the game's IPU decoding (no command
+    // runs meanwhile). peekInput copies up to max bytes from the current bit position (rounded down to a byte) out of
+    // the bit buffer and the input FIFO, which DMA channel 4 keeps filled as on hardware (at most 10 qwords);
+    // skipInput consumes n of them. IPU_CTRL and IPU_BP then read as if the IPU had consumed those bytes.
+    uint32_t peekInput(uint8_t *out, uint32_t max);
+    void skipInput(uint32_t n);
+
     struct Stats
     {
         uint64_t commands[16] = {};
