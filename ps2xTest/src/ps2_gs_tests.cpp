@@ -541,6 +541,30 @@ void register_ps2_gs_tests()
                      "NTSC should keep the 16667 us VBlank period");
         });
 
+        tc.Run("A host VBlank period override survives GsSetCrt and clears back to the video mode", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, 1u); // interlaced
+            setRegU32(ctx, 5, 3u); // PAL
+            setRegU32(ctx, 6, 1u); // frame mode
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            runtime.eeScheduler().setVBlankPeriodOverride(16667u);
+            t.IsTrue(std::fabs(runtime.eeScheduler().vblankHz() - 1000000.0 / 16667.0) < 1e-9,
+                     "the override should set the 60 Hz period");
+
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.IsTrue(std::fabs(runtime.eeScheduler().vblankHz() - 1000000.0 / 16667.0) < 1e-9,
+                     "a later PAL GsSetCrt should keep the override");
+
+            runtime.eeScheduler().setVBlankPeriodOverride(0u);
+            t.IsTrue(std::fabs(runtime.eeScheduler().vblankHz() - 50.0) < 1e-9,
+                     "clearing the override should return to the PAL 50 Hz period");
+        });
+
         tc.Run("GsSetCrt programs the SMODE1 CRTC mode for PAL and NTSC", [](TestCase &t)
         {
             PS2Runtime runtime;
