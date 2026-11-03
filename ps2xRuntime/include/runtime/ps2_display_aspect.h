@@ -24,4 +24,23 @@ namespace ps2_display_aspect
     inline bool isWideEnabled() { return wideEnabled().load(std::memory_order_relaxed); }
     inline void noteWideFrame() { wideFrames().fetch_add(1, std::memory_order_relaxed); }
     inline uint64_t wideFrameCount() { return wideFrames().load(std::memory_order_relaxed); }
+
+    // The size in window pixels of the picture rectangle the presenter last drew (width << 32 | height, 0 before the
+    // first present), so a host can render the frame at exactly that size (e.g. GPU upscaling). Purely informative.
+    inline std::atomic<uint64_t> &presentTarget()
+    {
+        static std::atomic<uint64_t> target{0};
+        return target;
+    }
+    inline void notePresentTarget(uint32_t width, uint32_t height)
+    {
+        presentTarget().store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
+    }
+    inline bool presentTargetSize(uint32_t &width, uint32_t &height)
+    {
+        const uint64_t v = presentTarget().load(std::memory_order_relaxed);
+        width = uint32_t(v >> 32);
+        height = uint32_t(v);
+        return width != 0 && height != 0;
+    }
 }
