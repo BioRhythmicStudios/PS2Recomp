@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -3288,11 +3289,18 @@ void PS2Runtime::run()
         const float dstHeight = std::min(screenHeight, screenWidth / displayAspect);
         const float dstWidth = dstHeight * displayAspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
+        Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        // Tell the host the picture's size in window pixels. A frame the host already rendered at that size is drawn
+        // 1:1 on whole pixels, so the window's filter leaves it untouched.
+        const uint32_t targetWidth = static_cast<uint32_t>(std::lround(dstWidth));
+        const uint32_t targetHeight = static_cast<uint32_t>(std::lround(dstHeight));
+        ps2_display_aspect::notePresentTarget(targetWidth, targetHeight);
+        if (presentWidth == targetWidth && presentHeight == targetHeight)
+            dstRect = Rectangle{std::floor(dstRect.x + 0.5f), std::floor(dstRect.y + 0.5f), srcWidth, srcHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
