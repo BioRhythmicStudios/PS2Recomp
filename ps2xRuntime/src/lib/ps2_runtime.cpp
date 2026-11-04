@@ -37,6 +37,8 @@
 #include <unordered_map>
 #include <sstream>
 
+extern "C" void *glfwGetProcAddress(const char *procname); // raylib's GLFW
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -1174,7 +1176,10 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        // PS2X_VSYNC=1: swap on the monitor's refresh, so an exclusive / borderless window does not tear. Pacing stays as it was.
+        const char *vsyncEnv = std::getenv("PS2X_VSYNC");
+        const bool vsync = vsyncEnv && std::strcmp(vsyncEnv, "1") == 0;
+        SetConfigFlags(vsync ? (FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT) : FLAG_WINDOW_RESIZABLE);
         // A 16:9 game mode (ps2_display_aspect.h) opens a 16:9 window of the same height.
         InitWindow(ps2_display_aspect::isWideEnabled() ? HOST_WINDOW_HEIGHT * 16 / 9 : HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT,
                    title);
@@ -3329,6 +3334,16 @@ void PS2Runtime::run()
         EndDrawing();
         ps2_pacing_trace::note(ps2_pacing_trace::kSwap);
         windowMode.update();
+#if defined(_WIN32)
+        // One line for bug reports: what the driver really uses, read after the window mode has settled.
+        static int swapIntervalCheck = 0;
+        if (++swapIntervalCheck == 300)
+        {
+            using GetSwapInterval = int(__stdcall *)();
+            if (auto get = reinterpret_cast<GetSwapInterval>(glfwGetProcAddress("wglGetSwapIntervalEXT")))
+                RUNTIME_LOG("[run] swap interval " << get());
+        }
+#endif
 
         if (WindowShouldClose())
         {
