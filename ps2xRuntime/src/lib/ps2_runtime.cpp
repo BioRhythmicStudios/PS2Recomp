@@ -39,6 +39,59 @@
 
 extern "C" void *glfwGetProcAddress(const char *procname); // raylib's GLFW
 
+#if defined(_WIN32)
+#include <atomic>
+#include <ctime>
+#include <filesystem>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// F12: a screenshot for the launcher's banner, in PS2X_SHOT_DIR. raylib handles F12 itself inside EndDrawing (a
+// full-size PNG in the working directory, encoded on the window thread), so the key stops here and never reaches it.
+using KeyCallback = void (*)(void *, int, int, int, int);
+extern "C" KeyCallback glfwSetKeyCallback(void *window, KeyCallback callback);
+extern "C" void *glfwGetCurrentContext();
+static std::atomic<bool> g_shotRequested{false};
+static KeyCallback g_raylibKeyCallback = nullptr;
+
+static void shotKeyCallback(void *window, int key, int scancode, int action, int mods)
+{
+    const int glfwKeyF12 = 301, glfwPress = 1;
+    if (key == glfwKeyF12)
+    {
+        if (action == glfwPress)
+            g_shotRequested.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (g_raylibKeyCallback)
+        g_raylibKeyCallback(window, key, scancode, action, mods);
+}
+
+// Reads the window here, then scales and encodes on another thread, so the game does not stop for it.
+static void saveWindowShot(Rectangle picture)
+{
+    rlDrawRenderBatchActive();
+    Image image = LoadImageFromScreen();
+    std::thread([image, picture]() mutable {
+        const char *dirEnv = std::getenv("PS2X_SHOT_DIR");
+        const std::string dir = dirEnv && *dirEnv ? dirEnv : "screenshots";
+        std::error_code error;
+        std::filesystem::create_directories(std::filesystem::u8path(dir), error);
+        ImageCrop(&image, picture); // no bars beside a 4:3 picture
+        if (image.width > 1280)
+            ImageResize(&image, 1280, image.height * 1280 / image.width);
+        char name[64];
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_s(&local, &now);
+        std::strftime(name, sizeof(name), "shot-%Y%m%d-%H%M%S.png", &local);
+        ExportImage(image, (dir + "/" + name).c_str());
+        UnloadImage(image);
+    }).detach();
+}
+#endif
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -1183,6 +1236,10 @@ bool PS2Runtime::initialize(const char *title)
         // A 16:9 game mode (ps2_display_aspect.h) opens a 16:9 window of the same height.
         InitWindow(ps2_display_aspect::isWideEnabled() ? HOST_WINDOW_HEIGHT * 16 / 9 : HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT,
                    title);
+#if defined(_WIN32)
+        // Not GetWindowHandle(): on Windows that is the HWND, not the GLFW window.
+        g_raylibKeyCallback = glfwSetKeyCallback(glfwGetCurrentContext(), shotKeyCallback);
+#endif
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -3331,6 +3388,23 @@ void PS2Runtime::run()
                 nextShot += shotInterval;
             }
         }
+#if defined(_WIN32)
+        {
+            static double shotMessageUntil = 0.0;
+            if (g_shotRequested.exchange(false, std::memory_order_relaxed))
+            {
+                saveWindowShot(dstRect);
+                shotMessageUntil = GetTime() + 2.0;
+            }
+            if (GetTime() < shotMessageUntil)
+            {
+                const int size = std::max(16, GetScreenHeight() / 36);
+                const char *text = "Screenshot saved for the launcher banner";
+                DrawRectangle(size, size, MeasureText(text, size) + size, size * 2, Fade(BLACK, 0.7f));
+                DrawText(text, size + size / 2, size + size / 2, size, GOLD);
+            }
+        }
+#endif
         EndDrawing();
         ps2_pacing_trace::note(ps2_pacing_trace::kSwap);
         windowMode.update();
