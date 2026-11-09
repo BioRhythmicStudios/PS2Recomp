@@ -21,6 +21,7 @@ FetchContent_Declare(
     toml11
     GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
     GIT_TAG v4.4.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(toml11)
 
@@ -28,6 +29,7 @@ FetchContent_Declare(
     fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt.git
     GIT_TAG 12.1.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(fmt)
  
@@ -53,6 +55,7 @@ FetchContent_Declare(
     rabbitizer
     GIT_REPOSITORY https://github.com/Decompollaborate/rabbitizer.git
     GIT_TAG 1.14.3
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(rabbitizer)
 
