@@ -77,10 +77,9 @@ else()
 
     FetchContent_Declare(
         raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS TRUE
+        # Release archive (42 MB): a shallow git clone still fetches every branch's tip (about 260 MB).
+        URL "https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz"
+        URL_HASH SHA256=aea98ecf5bc5c5e0b789a76de0083a21a70457050ea4cc2aec7566935f5e258e
     )
     FetchContent_MakeAvailable(raylib)
 

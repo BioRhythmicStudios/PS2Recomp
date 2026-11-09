@@ -19,9 +19,9 @@ FetchContent_MakeAvailable(elfio)
 
 FetchContent_Declare(
     toml11
-    GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
-    GIT_TAG v4.4.0
-    GIT_SHALLOW TRUE
+    # Release archive: a git clone also fetches toml11's test and docs submodules (about 350 MB).
+    URL https://github.com/ToruNiina/toml11/archive/refs/tags/v4.4.0.tar.gz
+    URL_HASH SHA256=815bfe6792aa11a13a133b86e7f0f45edc5d71eb78f5fb6686c49c7f792b9049
 )
 FetchContent_MakeAvailable(toml11)
 
