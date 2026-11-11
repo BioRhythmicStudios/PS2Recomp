@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -79,6 +81,209 @@ namespace
         RUNTIME_LOG("[pad] controller mappings from " << file << (ok ? " loaded" : " rejected") << "\n");
     }
 #endif
+}
+
+namespace
+{
+    enum StickDir
+    {
+        kStickNone,
+        kStickUp,
+        kStickDown,
+        kStickLeft,
+        kStickRight
+    };
+
+    struct ActionDef
+    {
+        const char *name;
+        uint16_t mask; // PS2 button bit, or 0 for a stick direction
+        StickDir stick;
+    };
+
+    const ActionDef kActions[] = {
+        {"up", PAD_UP, kStickNone},
+        {"down", PAD_DOWN, kStickNone},
+        {"left", PAD_LEFT, kStickNone},
+        {"right", PAD_RIGHT, kStickNone},
+        {"cross", PAD_CROSS, kStickNone},
+        {"circle", PAD_CIRCLE, kStickNone},
+        {"square", PAD_SQUARE, kStickNone},
+        {"triangle", PAD_TRIANGLE, kStickNone},
+        {"l1", PAD_L1, kStickNone},
+        {"r1", PAD_R1, kStickNone},
+        {"l2", PAD_L2, kStickNone},
+        {"r2", PAD_R2, kStickNone},
+        {"l3", PAD_L3, kStickNone},
+        {"r3", PAD_R3, kStickNone},
+        {"start", PAD_START, kStickNone},
+        {"select", PAD_SELECT, kStickNone},
+        {"stick_up", 0, kStickUp},
+        {"stick_down", 0, kStickDown},
+        {"stick_left", 0, kStickLeft},
+        {"stick_right", 0, kStickRight},
+    };
+    constexpr int kActionCount = static_cast<int>(sizeof(kActions) / sizeof(kActions[0]));
+    constexpr int kMaxPerAction = 4;
+
+    struct NamedCode
+    {
+        const char *name;
+        int code;
+    };
+
+    const NamedCode kKeyNames[] = {
+        {"A", KEY_A}, {"B", KEY_B}, {"C", KEY_C}, {"D", KEY_D}, {"E", KEY_E}, {"F", KEY_F}, {"G", KEY_G},
+        {"H", KEY_H}, {"I", KEY_I}, {"J", KEY_J}, {"K", KEY_K}, {"L", KEY_L}, {"M", KEY_M}, {"N", KEY_N},
+        {"O", KEY_O}, {"P", KEY_P}, {"Q", KEY_Q}, {"R", KEY_R}, {"S", KEY_S}, {"T", KEY_T}, {"U", KEY_U},
+        {"V", KEY_V}, {"W", KEY_W}, {"X", KEY_X}, {"Y", KEY_Y}, {"Z", KEY_Z},
+        {"0", KEY_ZERO}, {"1", KEY_ONE}, {"2", KEY_TWO}, {"3", KEY_THREE}, {"4", KEY_FOUR},
+        {"5", KEY_FIVE}, {"6", KEY_SIX}, {"7", KEY_SEVEN}, {"8", KEY_EIGHT}, {"9", KEY_NINE},
+        {"SPACE", KEY_SPACE}, {"ENTER", KEY_ENTER}, {"TAB", KEY_TAB}, {"BACKSPACE", KEY_BACKSPACE},
+        {"INSERT", KEY_INSERT}, {"DELETE", KEY_DELETE}, {"HOME", KEY_HOME}, {"END", KEY_END},
+        {"PAGE_UP", KEY_PAGE_UP}, {"PAGE_DOWN", KEY_PAGE_DOWN}, {"CAPS_LOCK", KEY_CAPS_LOCK},
+        {"UP", KEY_UP}, {"DOWN", KEY_DOWN}, {"LEFT", KEY_LEFT}, {"RIGHT", KEY_RIGHT},
+        {"LEFT_SHIFT", KEY_LEFT_SHIFT}, {"RIGHT_SHIFT", KEY_RIGHT_SHIFT},
+        {"LEFT_CONTROL", KEY_LEFT_CONTROL}, {"RIGHT_CONTROL", KEY_RIGHT_CONTROL},
+        {"LEFT_ALT", KEY_LEFT_ALT}, {"RIGHT_ALT", KEY_RIGHT_ALT},
+        {"MINUS", KEY_MINUS}, {"EQUAL", KEY_EQUAL}, {"LEFT_BRACKET", KEY_LEFT_BRACKET},
+        {"RIGHT_BRACKET", KEY_RIGHT_BRACKET}, {"BACKSLASH", KEY_BACKSLASH}, {"SEMICOLON", KEY_SEMICOLON},
+        {"APOSTROPHE", KEY_APOSTROPHE}, {"COMMA", KEY_COMMA}, {"PERIOD", KEY_PERIOD}, {"SLASH", KEY_SLASH},
+        {"GRAVE", KEY_GRAVE},
+        {"F1", KEY_F1}, {"F2", KEY_F2}, {"F3", KEY_F3}, {"F4", KEY_F4}, {"F5", KEY_F5}, {"F6", KEY_F6},
+        {"F7", KEY_F7}, {"F8", KEY_F8}, {"F9", KEY_F9}, {"F10", KEY_F10}, {"F11", KEY_F11},
+        {"KP_0", KEY_KP_0}, {"KP_1", KEY_KP_1}, {"KP_2", KEY_KP_2}, {"KP_3", KEY_KP_3}, {"KP_4", KEY_KP_4},
+        {"KP_5", KEY_KP_5}, {"KP_6", KEY_KP_6}, {"KP_7", KEY_KP_7}, {"KP_8", KEY_KP_8}, {"KP_9", KEY_KP_9},
+        {"KP_DECIMAL", KEY_KP_DECIMAL}, {"KP_DIVIDE", KEY_KP_DIVIDE}, {"KP_MULTIPLY", KEY_KP_MULTIPLY},
+        {"KP_SUBTRACT", KEY_KP_SUBTRACT}, {"KP_ADD", KEY_KP_ADD}, {"KP_ENTER", KEY_KP_ENTER},
+    };
+    // Esc (closes the game window) and F12 (screenshot) are left out on purpose.
+
+    const NamedCode kPadNames[] = {
+        {"SOUTH", GAMEPAD_BUTTON_RIGHT_FACE_DOWN}, {"EAST", GAMEPAD_BUTTON_RIGHT_FACE_RIGHT},
+        {"WEST", GAMEPAD_BUTTON_RIGHT_FACE_LEFT}, {"NORTH", GAMEPAD_BUTTON_RIGHT_FACE_UP},
+        {"DPAD_UP", GAMEPAD_BUTTON_LEFT_FACE_UP}, {"DPAD_DOWN", GAMEPAD_BUTTON_LEFT_FACE_DOWN},
+        {"DPAD_LEFT", GAMEPAD_BUTTON_LEFT_FACE_LEFT}, {"DPAD_RIGHT", GAMEPAD_BUTTON_LEFT_FACE_RIGHT},
+        {"L1", GAMEPAD_BUTTON_LEFT_TRIGGER_1}, {"R1", GAMEPAD_BUTTON_RIGHT_TRIGGER_1},
+        {"L2", GAMEPAD_BUTTON_LEFT_TRIGGER_2}, {"R2", GAMEPAD_BUTTON_RIGHT_TRIGGER_2},
+        {"L3", GAMEPAD_BUTTON_LEFT_THUMB}, {"R3", GAMEPAD_BUTTON_RIGHT_THUMB},
+        {"START", GAMEPAD_BUTTON_MIDDLE_RIGHT}, {"SELECT", GAMEPAD_BUTTON_MIDDLE_LEFT},
+    };
+
+    // The layout before bindings existed, less Esc as a second Circle key (Esc closes the window).
+    const char *const kDefaultKeys[kActionCount] = {
+        "UP, W", "DOWN, S", "LEFT, A", "RIGHT, D", "X, SPACE", "C", "Z, KP_0", "V, KP_1",
+        "Q", "E", "LEFT_SHIFT", "RIGHT_SHIFT", "", "", "ENTER", "TAB",
+        "", "", "", ""};
+    const char *const kDefaultPad[kActionCount] = {
+        "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT", "SOUTH", "EAST", "WEST", "NORTH",
+        "L1", "R1", "L2", "R2", "L3", "R3", "START", "SELECT",
+        "", "", "", ""};
+
+    struct BindingList
+    {
+        int codes[kMaxPerAction];
+        int count;
+    };
+
+    BindingList g_keys[kActionCount];
+    BindingList g_pads[kActionCount];
+    std::once_flag g_bindingsOnce;
+
+    std::string trimUpper(std::string s, bool upper)
+    {
+        const size_t a = s.find_first_not_of(" \t\r\n");
+        const size_t b = s.find_last_not_of(" \t\r\n");
+        s = a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+        for (char &c : s)
+            c = static_cast<char>(upper ? std::toupper(static_cast<unsigned char>(c)) : std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    // Fills one action's list from "NAME, NAME"; unknown names are appended to `unknown`.
+    void parseList(const std::string &value, const NamedCode *table, size_t tableSize, BindingList &out, std::string &unknown)
+    {
+        out.count = 0;
+        std::stringstream parts(value);
+        std::string part;
+        while (std::getline(parts, part, ','))
+        {
+            part = trimUpper(part, true);
+            if (part.empty())
+                continue;
+            int code = -1;
+            for (size_t i = 0; i < tableSize; ++i)
+                if (part == table[i].name)
+                    code = table[i].code;
+            if (code < 0)
+                unknown += (unknown.empty() ? "" : ", ") + part;
+            else if (out.count < kMaxPerAction)
+                out.codes[out.count++] = code;
+        }
+    }
+
+    void loadBindings()
+    {
+        std::string unknown;
+        for (int a = 0; a < kActionCount; ++a)
+        {
+            parseList(kDefaultKeys[a], kKeyNames, sizeof(kKeyNames) / sizeof(kKeyNames[0]), g_keys[a], unknown);
+            parseList(kDefaultPad[a], kPadNames, sizeof(kPadNames) / sizeof(kPadNames[0]), g_pads[a], unknown);
+        }
+
+        std::string file;
+        if (const char *env = std::getenv("PS2X_CONTROLS"); env && *env)
+            file = env;
+#if PS2X_PAD_GLFW
+        else
+            file = std::string(GetApplicationDirectory()) + "../controls.ini"; // the launcher's folder
+#endif
+        std::ifstream in(file, std::ios::binary);
+        if (file.empty() || !in)
+        {
+            RUNTIME_LOG("[pad] controls: defaults\n");
+            return;
+        }
+
+        int section = -1; // 0 keyboard, 1 controller
+        int lines = 0;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            line = trimUpper(line, false);
+            if (line.empty() || line[0] == ';' || line[0] == '#')
+                continue;
+            if (line == "[keyboard]")
+            {
+                section = 0;
+                continue;
+            }
+            if (line == "[controller]")
+            {
+                section = 1;
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (section < 0 || eq == std::string::npos)
+                continue;
+            const std::string action = trimUpper(line.substr(0, eq), false);
+            int a = 0;
+            while (a < kActionCount && action != kActions[a].name)
+                ++a;
+            if (a == kActionCount)
+            {
+                unknown += (unknown.empty() ? "" : ", ") + action;
+                continue;
+            }
+            if (section == 0)
+                parseList(line.substr(eq + 1), kKeyNames, sizeof(kKeyNames) / sizeof(kKeyNames[0]), g_keys[a], unknown);
+            else
+                parseList(line.substr(eq + 1), kPadNames, sizeof(kPadNames) / sizeof(kPadNames[0]), g_pads[a], unknown);
+            ++lines;
+        }
+        RUNTIME_LOG("[pad] controls from " << file << ": " << lines << " bindings"
+                                           << (unknown.empty() ? std::string() : "; ignored unknown names: " + unknown) << "\n");
+    }
 }
 
 void ps2PadHostUpdate()
@@ -155,95 +360,53 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
+    std::call_once(g_bindingsOnce, loadBindings);
+
     uint16_t btns = 0xFFFFu;
-    // The controller picked by ps2PadHostUpdate; the keyboard below works alongside it.
-    const int kGamepad = g_activePad.load(std::memory_order_relaxed);
-    const bool useGamepad = kGamepad >= 0 && IsGamepadAvailable(kGamepad);
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
+    // The controller picked by ps2PadHostUpdate; the keyboard works alongside it.
+    const int gamepad = g_activePad.load(std::memory_order_relaxed);
+    const bool useGamepad = gamepad >= 0 && IsGamepadAvailable(gamepad);
 
     if (useGamepad)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        ps2PadStickBytes(lx, ly, data[6], data[7]);
-        ps2PadStickBytes(rx, ry, data[4], data[5]);
+        ps2PadStickBytes(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X),
+                         GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y), data[6], data[7]);
+        ps2PadStickBytes(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X),
+                         GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y), data[4], data[5]);
     }
 
-    // Keyboard: always read, so it keeps working with a controller connected.
+    // Alt+Enter switches the window mode (ps2_runtime.cpp), so an Enter pressed with Alt held does nothing in the
+    // game until it is released.
+    static std::atomic<bool> enterIsWindowToggle{false};
+    const bool enterDown = IsKeyDown(KEY_ENTER);
+    if (!enterDown)
+        enterIsWindowToggle.store(false, std::memory_order_relaxed);
+    else if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
+        enterIsWindowToggle.store(true, std::memory_order_relaxed);
+    const bool enterUsable = enterDown && !enterIsWindowToggle.load(std::memory_order_relaxed);
+
+    int stickX = 0, stickY = 0;
+    bool stickPressed = false;
+    for (int a = 0; a < kActionCount; ++a)
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        // Alt+Enter switches the window mode (ps2_runtime.cpp), so an Enter pressed with Alt held is not Start
-        // until it is released.
-        static std::atomic<bool> enterIsWindowToggle{false};
-        const bool enterDown = IsKeyDown(KEY_ENTER);
-        if (!enterDown)
-            enterIsWindowToggle.store(false, std::memory_order_relaxed);
-        else if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
-            enterIsWindowToggle.store(true, std::memory_order_relaxed);
-        if (enterDown && !enterIsWindowToggle.load(std::memory_order_relaxed))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        bool down = false;
+        for (int i = 0; i < g_keys[a].count && !down; ++i)
+            down = g_keys[a].codes[i] == KEY_ENTER ? enterUsable : IsKeyDown(g_keys[a].codes[i]);
+        for (int i = 0; useGamepad && i < g_pads[a].count && !down; ++i)
+            down = IsGamepadButtonDown(gamepad, g_pads[a].codes[i]);
+        if (!down)
+            continue;
+        if (kActions[a].mask != 0)
+        {
+            btns &= static_cast<uint16_t>(~kActions[a].mask);
+            continue;
+        }
+        stickPressed = true;
+        stickX += kActions[a].stick == kStickRight ? 1 : kActions[a].stick == kStickLeft ? -1 : 0;
+        stickY += kActions[a].stick == kStickDown ? 1 : kActions[a].stick == kStickUp ? -1 : 0;
     }
+    if (stickPressed)
+        ps2PadStickBytes(static_cast<float>(stickX), static_cast<float>(stickY), data[6], data[7]);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
