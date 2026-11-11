@@ -3191,6 +3191,7 @@ void PS2Runtime::run()
         EndDrawing();
         ps2_pacing_trace::note(ps2_pacing_trace::kSwap);
         windowMode.update();
+        ps2PadHostUpdate();
 
         if (WindowShouldClose())
         {

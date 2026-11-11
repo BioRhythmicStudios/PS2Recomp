@@ -1,9 +1,30 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "ps2_log.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+#define PS2X_PAD_GLFW 1
+// raylib's desktop build contains GLFW 3.4. raylib's IsGamepadAvailable() is true for any joystick, mapped or not,
+// so the mapping check needs GLFW's own joystick functions (GLFW/glfw3.h).
+extern "C"
+{
+    int glfwJoystickPresent(int jid);
+    int glfwJoystickIsGamepad(int jid);
+    const char *glfwGetJoystickName(int jid);
+    const char *glfwGetJoystickGUID(int jid);
+    int glfwUpdateGamepadMappings(const char *string);
+}
+#else
+#define PS2X_PAD_GLFW 0
+#endif
 
 namespace
 {
@@ -26,6 +47,85 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    constexpr int kMaxHostPads = 4;   // raylib's MAX_GAMEPADS
+    std::atomic<int> g_activePad{-1}; // set on the main thread by ps2PadHostUpdate, read on the game thread
+
+#if PS2X_PAD_GLFW
+    // Mappings missing from GLFW 3.4's built-in list, in SDL_GameControllerDB format.
+    // DualSense Edge (054C:0DF2): the DualSense's DirectInput layout (GLFW's "PS5 Controller" line), new product ID.
+    const char *const kExtraMappings =
+        "030000004c050000f20d000000000000,DualSense Edge,a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,"
+        "dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,misc1:b13,"
+        "rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,x:b0,y:b3,platform:Windows,\n";
+
+    void loadExtraMappings()
+    {
+        if (!glfwUpdateGamepadMappings(kExtraMappings))
+            RUNTIME_LOG("[pad] built-in extra controller mappings were rejected\n");
+
+        std::string file;
+        if (const char *env = std::getenv("PS2X_GAMEPAD_DB"); env && *env)
+            file = env;
+        else
+            file = std::string(GetApplicationDirectory()) + "gamecontrollerdb.txt"; // raylib: ends in a separator
+        std::ifstream in(file, std::ios::binary);
+        if (!in)
+            return;
+        std::ostringstream text;
+        text << in.rdbuf();
+        // GLFW skips lines it can't parse and other platforms' lines; it fails only on a bad call.
+        const bool ok = glfwUpdateGamepadMappings(text.str().c_str()) != 0;
+        RUNTIME_LOG("[pad] controller mappings from " << file << (ok ? " loaded" : " rejected") << "\n");
+    }
+#endif
+}
+
+void ps2PadHostUpdate()
+{
+#if PS2X_PAD_GLFW
+    static bool mappingsLoaded = false;
+    if (!mappingsLoaded)
+    {
+        mappingsLoaded = true;
+        loadExtraMappings();
+    }
+
+    // raylib already checks presence of four slots every frame; a quarter-second rescan is enough for hot-plugging.
+    static uint32_t frame = 0;
+    if ((frame++ % 15u) != 0u)
+        return;
+
+    int active = -1;
+    std::string summary;
+    for (int jid = 0; jid < kMaxHostPads; ++jid)
+    {
+        if (!glfwJoystickPresent(jid))
+            continue;
+        const bool mapped = glfwJoystickIsGamepad(jid) == 1;
+        if (mapped && active < 0)
+            active = jid;
+        const char *name = glfwGetJoystickName(jid);
+        const char *guid = glfwGetJoystickGUID(jid);
+        summary += "slot " + std::to_string(jid) + ": \"" + (name ? name : "?") + "\" " + (guid ? guid : "?") +
+                   (mapped ? " (mapped); " : " (no mapping); ");
+    }
+    g_activePad.store(active, std::memory_order_relaxed);
+
+    static std::string lastSummary("\x01"); // never a real summary, so the first scan is always logged
+    if (summary != lastSummary)
+    {
+        lastSummary = summary;
+        if (summary.empty())
+            RUNTIME_LOG("[pad] no controller connected; keyboard only\n");
+        else if (active < 0)
+            RUNTIME_LOG("[pad] " << summary << "none has a mapping; keyboard only\n");
+        else
+            RUNTIME_LOG("[pad] " << summary << "using slot " << active << "\n");
+    }
+#else
+    g_activePad.store(IsGamepadAvailable(0) ? 0 : -1, std::memory_order_relaxed);
+#endif
 }
 
 void ps2PadStickBytes(float x, float y, uint8_t &outX, uint8_t &outY)
@@ -56,8 +156,9 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    // The controller picked by ps2PadHostUpdate; the keyboard below works alongside it.
+    const int kGamepad = g_activePad.load(std::memory_order_relaxed);
+    const bool useGamepad = kGamepad >= 0 && IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
@@ -103,7 +204,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         ps2PadStickBytes(lx, ly, data[6], data[7]);
         ps2PadStickBytes(rx, ry, data[4], data[5]);
     }
-    else
+
+    // Keyboard: always read, so it keeps working with a controller connected.
     {
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);

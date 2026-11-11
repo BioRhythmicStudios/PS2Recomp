@@ -19,4 +19,11 @@ public:
 // below), so the stick is mapped from its circle onto the square: same direction, larger axis = distance pushed.
 void ps2PadStickBytes(float x, float y, uint8_t &outX, uint8_t &outY);
 
+// Main thread only, once per presented frame (after EndDrawing has polled input). Picks the controller readState
+// uses: the first connected one that has a gamepad mapping, so an unmapped device (a wheel, a virtual joystick, an
+// unknown pad) in the first slot no longer hides a working controller. Logs every connected controller when the set
+// changes ("[pad]" lines). On the first call it adds mappings GLFW lacks, plus gamecontrollerdb.txt from the game
+// exe's folder or the file named by PS2X_GAMEPAD_DB, if present (SDL_GameControllerDB format).
+void ps2PadHostUpdate();
+
 #endif
