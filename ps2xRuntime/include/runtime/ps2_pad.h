@@ -31,10 +31,11 @@ void ps2PadHostUpdate();
 //   [keyboard]                      [controller]
 //   cross = X, SPACE                cross = SOUTH
 // One line per action: up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select, and
-// stick_up stick_down stick_left stick_right (a full push of the left stick). Up to four names per line; an empty
+// stick_up stick_down stick_left stick_right (a full push of the left stick), camera_up camera_down camera_left
+// camera_right (a full push of the right stick, which turns a free camera). Up to four names per line; an empty
 // line value unbinds the action; actions left out keep their defaults. Key names are raylib's KEY_ names without
 // the prefix (A, 1, SPACE, LEFT_SHIFT, KP_0, F1...). Controller names: SOUTH EAST WEST NORTH (face buttons by
 // position), DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT, L1 R1 L2 R2 L3 R3, START, SELECT. The analog sticks always
-// drive the PS2 sticks; a pressed stick_ action overrides the left stick.
+// drive the PS2 sticks; a pressed stick_ action overrides the left stick, a camera_ action the right stick.
 
 #endif
