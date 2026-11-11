@@ -99,6 +99,7 @@ namespace
         const char *name;
         uint16_t mask; // PS2 button bit, or 0 for a stick direction
         StickDir stick;
+        bool rightStick; // camera_ actions push the right stick
     };
 
     const ActionDef kActions[] = {
@@ -122,6 +123,10 @@ namespace
         {"stick_down", 0, kStickDown},
         {"stick_left", 0, kStickLeft},
         {"stick_right", 0, kStickRight},
+        {"camera_up", 0, kStickUp, true},
+        {"camera_down", 0, kStickDown, true},
+        {"camera_left", 0, kStickLeft, true},
+        {"camera_right", 0, kStickRight, true},
     };
     constexpr int kActionCount = static_cast<int>(sizeof(kActions) / sizeof(kActions[0]));
     constexpr int kMaxPerAction = 4;
@@ -173,11 +178,13 @@ namespace
     // The layout before bindings existed, less Esc as a second Circle key (Esc closes the window).
     const char *const kDefaultKeys[kActionCount] = {
         "UP, W", "DOWN, S", "LEFT, A", "RIGHT, D", "X, SPACE", "C", "Z, KP_0", "V, KP_1",
-        "Q", "E", "LEFT_SHIFT", "RIGHT_SHIFT", "", "", "ENTER", "TAB",
-        "", "", "", ""};
+        "Q", "E", "LEFT_SHIFT", "RIGHT_SHIFT", "", "R", "ENTER", "TAB",
+        "", "", "", "",
+        "I", "K", "J", "L"};
     const char *const kDefaultPad[kActionCount] = {
         "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT", "SOUTH", "EAST", "WEST", "NORTH",
         "L1", "R1", "L2", "R2", "L3", "R3", "START", "SELECT",
+        "", "", "", "",
         "", "", "", ""};
 
     struct BindingList
@@ -385,8 +392,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         enterIsWindowToggle.store(true, std::memory_order_relaxed);
     const bool enterUsable = enterDown && !enterIsWindowToggle.load(std::memory_order_relaxed);
 
-    int stickX = 0, stickY = 0;
-    bool stickPressed = false;
+    int stickX[2] = {0, 0}, stickY[2] = {0, 0}; // [0] left stick, [1] right stick
+    bool stickPressed[2] = {false, false};
     for (int a = 0; a < kActionCount; ++a)
     {
         bool down = false;
@@ -401,12 +408,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             btns &= static_cast<uint16_t>(~kActions[a].mask);
             continue;
         }
-        stickPressed = true;
-        stickX += kActions[a].stick == kStickRight ? 1 : kActions[a].stick == kStickLeft ? -1 : 0;
-        stickY += kActions[a].stick == kStickDown ? 1 : kActions[a].stick == kStickUp ? -1 : 0;
+        const int s = kActions[a].rightStick ? 1 : 0;
+        stickPressed[s] = true;
+        stickX[s] += kActions[a].stick == kStickRight ? 1 : kActions[a].stick == kStickLeft ? -1 : 0;
+        stickY[s] += kActions[a].stick == kStickDown ? 1 : kActions[a].stick == kStickUp ? -1 : 0;
     }
-    if (stickPressed)
-        ps2PadStickBytes(static_cast<float>(stickX), static_cast<float>(stickY), data[6], data[7]);
+    if (stickPressed[0])
+        ps2PadStickBytes(static_cast<float>(stickX[0]), static_cast<float>(stickY[0]), data[6], data[7]);
+    if (stickPressed[1])
+        ps2PadStickBytes(static_cast<float>(stickX[1]), static_cast<float>(stickY[1]), data[4], data[5]);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

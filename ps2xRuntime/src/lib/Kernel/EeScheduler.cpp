@@ -392,9 +392,17 @@ uint32_t EeScheduler::idleCycleBudget(uint32_t limit) const noexcept
     return static_cast<uint32_t>(std::max<uint64_t>(budget, 1u));
 }
 
+// A host hook that calls a short guest function directly (not from the run loop) holds checkpoints for the length
+// of that call: no checkpoint may stop it part way, since nothing would resume it. Cycles are still counted, and a
+// due checkpoint is taken at the first one after the hold ends. Game thread only.
+static int g_checkpointHold = 0;
+extern "C" void ps2xHoldEeCheckpoints(int hold) { g_checkpointHold += hold > 0 ? 1 : -1; }
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+    if (g_checkpointHold > 0)
+        return false;
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
