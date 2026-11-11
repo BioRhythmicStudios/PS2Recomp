@@ -3418,6 +3418,7 @@ void PS2Runtime::run()
                 RUNTIME_LOG("[run] swap interval " << get());
         }
 #endif
+        ps2PadHostUpdate();
 
         if (WindowShouldClose())
         {
