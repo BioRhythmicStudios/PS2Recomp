@@ -26,4 +26,15 @@ void ps2PadStickBytes(float x, float y, uint8_t &outX, uint8_t &outY);
 // exe's folder or the file named by PS2X_GAMEPAD_DB, if present (SDL_GameControllerDB format).
 void ps2PadHostUpdate();
 
+// Key and controller bindings (readState loads them once). The file is PS2X_CONTROLS, or else controls.ini in the
+// folder above the game exe (the launcher's folder). Without a file the defaults below apply. Format:
+//   [keyboard]                      [controller]
+//   cross = X, SPACE                cross = SOUTH
+// One line per action: up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select, and
+// stick_up stick_down stick_left stick_right (a full push of the left stick). Up to four names per line; an empty
+// line value unbinds the action; actions left out keep their defaults. Key names are raylib's KEY_ names without
+// the prefix (A, 1, SPACE, LEFT_SHIFT, KP_0, F1...). Controller names: SOUTH EAST WEST NORTH (face buttons by
+// position), DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT, L1 R1 L2 R2 L3 R3, START, SELECT. The analog sticks always
+// drive the PS2 sticks; a pressed stick_ action overrides the left stick.
+
 #endif
